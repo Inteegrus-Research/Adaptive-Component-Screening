@@ -142,3 +142,5 @@ def run(input_path, output_dir, seed=SEED):
 
 if __name__=="__main__":
     ap=argparse.ArgumentParser(); ap.add_argument("--input",required=True); ap.add_argument("--output-dir",default="reports/benchmark"); ap.add_argument("--seed",type=int,default=SEED); args=ap.parse_args(); print(json.dumps(run(args.input,args.output_dir,args.seed),indent=2,default=str))
+
+

@@ -8,10 +8,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sqlite3
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import joblib
 import numpy as np
@@ -107,6 +108,26 @@ def _canonical_category(df: pd.DataFrame, col: str) -> pd.Series:
 
 def _aggregate_unique(values: pd.Series) -> set[str]:
     return {str(v) for v in values.dropna().astype(str).unique()}
+
+
+def _operational_schema(columns: Sequence[str] | list[str]) -> list[str]:
+    """Return schema fields that are legitimately observable at inference.
+
+    Evaluation labels, split metadata, latent truth and future targets are not schema
+    requirements for a deployment upload. Future value readpoints are dynamic and are
+    therefore treated separately from static schema requirements.
+    """
+    excluded = {
+        "split", "defect_state", "latent_defect_label", "failure_mode", "primary_failure_mode",
+        "high_but_safe", "measurement_only_anomaly", "scenario_id", "catastrophic_false_negative_target",
+        "drift_failure_count",
+    }
+    out=[]
+    for c in map(str, columns):
+        if c in excluded or c.startswith("target_") or c.startswith("future_defective_") or c.startswith("latent_") or c.startswith("absolute_fail_") or c.startswith("drift_failure_") or re.fullmatch(r"value_\d+(?:\.\d+)?h", c):
+            continue
+        out.append(c)
+    return sorted(set(out))
 
 
 def _canonical_parameter_series(s: pd.Series) -> pd.Series:
@@ -256,87 +277,393 @@ def _ood_v4_status(score: float, profile: OODProfileV4) -> str:
     return "LOW"
 
 
-def _ood_v4_score_part(profile: OODProfileV4, part: pd.DataFrame, global_schema: set[str]) -> dict[str, Any]:
-    reasons = []
-    c = {}
-    family = str(part["component_family"].dropna().iloc[0]) if "component_family" in part.columns and part["component_family"].notna().any() else "<MISSING>"
-    params = sorted({str(v) for v in part["parameter"].dropna().unique()}) if "parameter" in part.columns else []
-    fs = "MISSING" if family == "<MISSING>" else ("KNOWN" if family in profile.known_families else "NOVEL")
-    c["family_status"] = fs
-    c["family_novelty"] = float(fs == "NOVEL")
-    if fs == "NOVEL":
-        reasons.append(f"Component family '{family}' is outside the reference domain.")
-    unknown = [p for p in params if p not in profile.known_parameters]
-    c["parameter_status"] = "MISSING" if not params else ("NOVEL" if unknown else "KNOWN")
-    c["parameter_novelty"] = float(bool(unknown))
-    if unknown:
-        reasons.append("Parameter semantics are unseen: " + ", ".join(unknown[:5]))
-    for col, known, key in [("test_method", profile.known_test_methods, "test_method"), ("stress_mode", profile.known_stress_modes, "stress")]:
-        if col not in part.columns or not part[col].notna().any():
-            c[f"{key}_status"] = "MISSING"
-            c[f"{key}_novelty"] = 0.0
-            continue
-        vals = {str(v) for v in part[col].dropna().unique()}
-        if not known:
-            c[f"{key}_status"] = "UNOBSERVED_IN_REFERENCE"
-            c[f"{key}_novelty"] = 0.0
-        else:
-            nov = vals - set(known)
-            c[f"{key}_status"] = "NOVEL" if nov else "KNOWN"
-            c[f"{key}_novelty"] = float(bool(nov))
-            if nov:
-                reasons.append(f"{col} values are outside the reference domain: {', '.join(sorted(nov)[:5])}")
-    missing = sorted(set(profile.expected_columns) - global_schema)
-    c["schema_missing_fraction"] = len(missing) / max(len(profile.expected_columns), 1)
+def _ood_v4_score_part(
+    profile: OODProfileV4,
+    part: pd.DataFrame,
+    global_schema: set[str],
+) -> dict[str, Any]:
+    """Score one part against the conditional OOD reference profile.
 
+    Design rules:
+      1. Numeric comparisons are conditioned on family + parameter where available.
+      2. Different physical quantities are never pooled into one numeric space.
+      3. Context novelty is reported separately from physical distribution shift.
+      4. Missing optional schema degrades completeness but does not fabricate OOD.
+      5. Robust scaling prevents ordinary reference-tail observations becoming OOD.
+      6. reference_level is explicit audit metadata.
+    """
+    reasons: list[str] = []
+    components: dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # Semantic identity
+    # ------------------------------------------------------------------
+    family = (
+        str(part["component_family"].dropna().iloc[0])
+        if (
+            "component_family" in part.columns
+            and part["component_family"].notna().any()
+        )
+        else "<MISSING>"
+    )
+
+    params = (
+        sorted({str(v) for v in part["parameter"].dropna().unique()})
+        if "parameter" in part.columns
+        else []
+    )
+
+    family_status = (
+        "MISSING"
+        if family == "<MISSING>"
+        else (
+            "KNOWN"
+            if family in profile.known_families
+            else "NOVEL"
+        )
+    )
+
+    components["family_status"] = family_status
+    components["family_novelty"] = float(family_status == "NOVEL")
+
+    if family_status == "NOVEL":
+        reasons.append(
+            f"Component family '{family}' is outside the reference domain."
+        )
+
+    unknown_parameters = [
+        p for p in params
+        if p not in profile.known_parameters
+    ]
+
+    if not params:
+        parameter_status = "MISSING"
+    elif unknown_parameters:
+        parameter_status = "NOVEL"
+    else:
+        parameter_status = "KNOWN"
+
+    components["parameter_status"] = parameter_status
+    components["parameter_novelty"] = float(bool(unknown_parameters))
+
+    if unknown_parameters:
+        reasons.append(
+            "Parameter semantics are unseen: "
+            + ", ".join(unknown_parameters[:5])
+        )
+
+    # ------------------------------------------------------------------
+    # Context semantics
+    # ------------------------------------------------------------------
+    for col, known_values, key in (
+        ("test_method", profile.known_test_methods, "test_method"),
+        ("stress_mode", profile.known_stress_modes, "stress"),
+    ):
+        if col not in part.columns or not part[col].notna().any():
+            components[f"{key}_status"] = "MISSING"
+            components[f"{key}_novelty"] = 0.0
+            continue
+
+        values = {
+            str(v)
+            for v in part[col].dropna().unique()
+        }
+
+        if not known_values:
+            # The reference simply had no observations of this field.
+            # It is not legitimate to call that "novel".
+            components[f"{key}_status"] = "UNOBSERVED_IN_REFERENCE"
+            components[f"{key}_novelty"] = 0.0
+        else:
+            novel_values = values - set(known_values)
+
+            components[f"{key}_status"] = (
+                "NOVEL" if novel_values else "KNOWN"
+            )
+            components[f"{key}_novelty"] = float(bool(novel_values))
+
+            if novel_values:
+                reasons.append(
+                    f"{col} values are outside the reference domain: "
+                    + ", ".join(sorted(novel_values)[:5])
+                )
+
+    # ------------------------------------------------------------------
+    # Schema completeness
+    # ------------------------------------------------------------------
+    expected_schema = set(
+        _operational_schema(profile.expected_columns)
+    )
+    observed_schema = set(
+        _operational_schema(global_schema)
+    )
+
+    missing_fields = sorted(
+        expected_schema - observed_schema
+    )
+
+    components["schema_missing_fraction"] = (
+        len(missing_fields) / max(len(expected_schema), 1)
+    )
+
+    components["schema_status"] = (
+        "DEGRADED" if missing_fields else "COMPLETE"
+    )
+
+    # IMPORTANT:
+    # Missing optional fields affect completeness only.
+    # They do NOT become numeric OOD evidence.
+
+    # ------------------------------------------------------------------
+    # Population-relative and trajectory-relative evidence
+    # ------------------------------------------------------------------
     x = _v3_prepare(part)
-    vals = []
-    slopes = []
-    for (fam, param), g in x.groupby(["component_family", "parameter"], dropna=False, sort=True):
-        key = _v3_key(fam, param)
-        pkey = _v3_key("*", param)
-        ref = profile.conditional_groups.get(key) or profile.conditional_groups.get(pkey)
-        if ref and ref.get("value"):
-            st = ref["value"]
-            arr = pd.to_numeric(g["value_num"], errors="coerce").dropna().to_numpy(float)
-            if arr.size:
-                z = np.abs((arr - st["median"]) / max(st["scale"], 1e-12))
-                tail = float(np.mean((arr < st["q01"]) | (arr > st["q99"])))
-                # Tight z-score scale factor (/2.0)
-                vals.append(float(np.clip(np.median(z) / 2.0 + 0.4 * tail, 0, 1)))
-                if vals[-1] >= 0.5:
-                    reasons.append(f"{param}: measurement distribution shifted")
-        tr = profile.trajectory_groups.get(key) or profile.trajectory_groups.get(pkey)
-        if tr and tr.get("slope"):
-            for _, pg in g.groupby("part_id", sort=False):
-                pg = pg.dropna(subset=["time_h", "value_num"]).sort_values("time_h")
-                if len(pg) >= 2:
-                    dt = float(pg["time_h"].iloc[-1] - pg["time_h"].iloc[0])
-                    if dt > 0:
-                        st = tr["slope"]
-                        sl = float((pg["value_num"].iloc[-1] - pg["value_num"].iloc[0]) / dt)
-                        slopes.append(float(np.clip(abs(sl - st["median"]) / max(2.0 * st["scale"], 1e-12), 0, 1)))
-    c["measurement_shift"] = float(np.mean(vals)) if vals else 0.0
-    c["trajectory_shift"] = float(np.mean(slopes)) if slopes else 0.0
-    
-    physical = max(c["family_novelty"], c["parameter_novelty"])
-    context = max(c.get("test_method_novelty", 0.0), c.get("stress_novelty", 0.0))
-    population = max(c["measurement_shift"], c["trajectory_shift"])
-    
-    # Strictly calibrated weighting: 10% Physical, 20% Contextual, 70% Population
-    score = float(np.clip(0.10 * physical + 0.20 * context + 0.70 * population, 0, 1))
-    status = "SEVERE" if physical >= 1 else _ood_v4_status(score, profile)
+
+    measurement_scores: list[float] = []
+    trajectory_scores: list[float] = []
+
+    for (fam, param), group in x.groupby(
+        ["component_family", "parameter"],
+        dropna=False,
+        sort=True,
+    ):
+        family_parameter_key = _v3_key(fam, param)
+        parameter_only_key = _v3_key("*", param)
+
+        reference = (
+            profile.conditional_groups.get(family_parameter_key)
+            or profile.conditional_groups.get(parameter_only_key)
+        )
+
+        # --------------------------------------------------------------
+        # Population / measurement deviation
+        # --------------------------------------------------------------
+        if reference and reference.get("value"):
+            stats = reference["value"]
+
+            values = (
+                pd.to_numeric(
+                    group["value_num"],
+                    errors="coerce",
+                )
+                .dropna()
+                .to_numpy(float)
+            )
+
+            if values.size:
+                z = np.abs(
+                    (values - stats["median"])
+                    / max(stats["scale"], 1e-12)
+                )
+
+                tail_fraction = float(
+                    np.mean(
+                        (values < stats["q01"])
+                        | (values > stats["q99"])
+                    )
+                )
+
+                # Robust calibration.
+                #
+                # Previous /2 scaling was too aggressive:
+                # ordinary reference-tail variation could saturate.
+                #
+                # /6 retains strong sensitivity to real distribution
+                # displacement while preventing normal 2-3 sigma
+                # observations from automatically becoming HIGH OOD.
+                measurement_score = float(
+                    np.clip(
+                        np.median(z) / 6.0
+                        + 0.20 * tail_fraction,
+                        0.0,
+                        1.0,
+                    )
+                )
+
+                measurement_scores.append(measurement_score)
+
+                if measurement_score >= 0.50:
+                    reasons.append(
+                        f"{param}: measurement distribution shifted"
+                    )
+
+        # --------------------------------------------------------------
+        # Trajectory / temporal deviation
+        # --------------------------------------------------------------
+        trajectory_reference = (
+            profile.trajectory_groups.get(family_parameter_key)
+            or profile.trajectory_groups.get(parameter_only_key)
+        )
+
+        if trajectory_reference and trajectory_reference.get("slope"):
+            slope_stats = trajectory_reference["slope"]
+
+            for _, part_group in group.groupby(
+                "part_id",
+                sort=False,
+            ):
+                part_group = (
+                    part_group
+                    .dropna(subset=["time_h", "value_num"])
+                    .sort_values("time_h")
+                )
+
+                if len(part_group) < 2:
+                    continue
+
+                delta_t = float(
+                    part_group["time_h"].iloc[-1]
+                    - part_group["time_h"].iloc[0]
+                )
+
+                if delta_t <= 0:
+                    continue
+
+                slope = float(
+                    (
+                        part_group["value_num"].iloc[-1]
+                        - part_group["value_num"].iloc[0]
+                    )
+                    / delta_t
+                )
+
+                trajectory_score = float(
+                    np.clip(
+                        abs(
+                            slope - slope_stats["median"]
+                        )
+                        / max(
+                            6.0 * slope_stats["scale"],
+                            1e-12,
+                        ),
+                        0.0,
+                        1.0,
+                    )
+                )
+
+                trajectory_scores.append(trajectory_score)
+
+                if trajectory_score >= 0.50:
+                    reasons.append(
+                        f"{param}: trajectory differs from reference"
+                    )
+
+    components["measurement_shift"] = (
+        float(np.mean(measurement_scores))
+        if measurement_scores
+        else 0.0
+    )
+
+    components["trajectory_shift"] = (
+        float(np.mean(trajectory_scores))
+        if trajectory_scores
+        else 0.0
+    )
+
+    # ------------------------------------------------------------------
+    # Explicit evidence axes
+    # ------------------------------------------------------------------
+    physical = max(
+        components["family_novelty"],
+        components["parameter_novelty"],
+    )
+
+    context = max(
+        components.get("test_method_novelty", 0.0),
+        components.get("stress_novelty", 0.0),
+    )
+
+    population = max(
+        components["measurement_shift"],
+        components["trajectory_shift"],
+    )
+
+    components["physical_score"] = float(physical)
+    components["context_score"] = float(context)
+    components["population_score"] = float(population)
+
+    # OOD score is domain novelty, NOT defect probability.
+    score = float(
+        np.clip(
+            0.10 * physical
+            + 0.20 * context
+            + 0.70 * population,
+            0.0,
+            1.0,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Status semantics
+    # ------------------------------------------------------------------
+    if physical >= 1.0:
+        # Completely unseen physical semantic domain.
+        status = "SEVERE"
+
+    elif context >= 1.0:
+        # Unseen method/stress context is meaningful, but does not
+        # automatically mean an unknown physical quantity.
+        status = "MODERATE"
+
+    else:
+        status = _ood_v4_status(
+            score,
+            profile,
+        )
+
+    if components["measurement_shift"] >= 0.50:
+        reasons.append(
+            "Population-relative measurement shift is elevated."
+        )
+
+    if components["trajectory_shift"] >= 0.50:
+        reasons.append(
+            "Population-relative trajectory shift is elevated."
+        )
+
+    # ------------------------------------------------------------------
+    # Reference provenance / auditability
+    # ------------------------------------------------------------------
+    if (
+        family_status != "KNOWN"
+        or parameter_status != "KNOWN"
+        or not params
+    ):
+        reference_level = "none"
+
+    elif (
+        len(params) == 1
+        and _v3_key(
+            family,
+            params[0],
+        ) in profile.conditional_groups
+    ):
+        reference_level = "family+parameter"
+
+    elif (
+        len(params) >= 1
+        and _v3_key(
+            "*",
+            params[0],
+        ) in profile.conditional_groups
+    ):
+        reference_level = "parameter"
+
+    else:
+        reference_level = "none"
+
+    components["reference_level"] = reference_level
+
     return {
         "part_id": str(part["part_id"].iloc[0]),
         "score": score,
         "status": status,
         "reasons": list(dict.fromkeys(reasons)),
-        "components": c,
-        "schema_missing_fields": missing,
-        "semantic_status": fs,
-        "parameter_status": c["parameter_status"]
+        "components": components,
+        "schema_missing_fields": missing_fields,
+        "semantic_status": family_status,
+        "parameter_status": parameter_status,
     }
-
 
 def fit_ood_profile(
     reference: pd.DataFrame | str | Path,
@@ -349,7 +676,7 @@ def fit_ood_profile(
     max_rows = int(cfg.get("ood", {}).get("max_reference_rows", 50000))
     if len(d) > max_rows:
         d = d.sample(n=max_rows, random_state=int(cfg.get("runtime", {}).get("random_seed", 20260831)))
-    expected = sorted(map(str, d.columns))
+    expected = _operational_schema(list(d.columns))
     x = _v3_prepare(d)
     fam = sorted(_aggregate_unique(_canonical_category(d, "component_family")))
     params = sorted(_aggregate_unique(_canonical_category(x, "parameter")))
@@ -400,8 +727,8 @@ def fit_ood_profile(
         for _, pg in wide.groupby(wide["part_id"].astype(str), sort=False):
             scores.append(_ood_v4_score_part(provisional, pg, set(expected))["score"])
     arr = np.asarray(scores, dtype=float)
-    moderate = float(np.quantile(arr, 0.95)) if arr.size else 0.40
-    severe = float(np.quantile(arr, 0.99)) if arr.size else 0.75
+    moderate = max(0.40, float(np.quantile(arr, 0.95)) if arr.size else 0.40)
+    severe = max(0.75, float(np.quantile(arr, 0.99)) if arr.size else 0.75)
     if severe <= moderate:
         severe = min(1.0, moderate + 0.05)
     profile = OODProfileV4(
@@ -446,24 +773,252 @@ def load_ood_profile(path: str | Path, *, require_compatibility: bool = True) ->
     raise ValueError("Unsupported OOD profile artifact; rebuild with ood_profile_v4.")
 
 
-def assess_data_ood(profile: OODProfileV4, input_df: pd.DataFrame, as_of_h: float | None = None) -> dict[str, Any]:
-    d = _v3_prepare(input_df, as_of_h=as_of_h)
-    schema = set(map(str, input_df.columns))
-    parts = []
+def assess_data_ood(
+    profile: OODProfileV4,
+    input_df: pd.DataFrame,
+    as_of_h: float | None = None,
+) -> dict[str, Any]:
+    """Assess OOD at part and dataset level.
+
+    Dataset-level status is deliberately robust to isolated tails.
+
+    A single unusual component must not cause an otherwise familiar
+    production batch to be labelled globally OOD.
+    """
+
+    d = _v3_prepare(
+        input_df,
+        as_of_h=as_of_h,
+    )
+
+    schema = set(
+        map(str, input_df.columns)
+    )
+
     if "part_id" not in d.columns:
-        return {"score": 1.0, "status": "SEVERE", "parts": [], "profile_version": profile.profile_version, "schema": {"status": "DEGRADED"}}
-    for _, pg in d.groupby(d["part_id"].astype(str), sort=False):
-        parts.append(_ood_v4_score_part(profile, pg, schema))
-    score = max([p["score"] for p in parts], default=0.0)
-    status = "SEVERE" if any(p["status"] == "SEVERE" for p in parts) else ("MODERATE" if any(p["status"] == "MODERATE" for p in parts) else "LOW")
-    missing = sorted(set(profile.expected_columns) - schema)
+        return {
+            "score": 1.0,
+            "status": "SEVERE",
+            "parts": [],
+            "profile_version": profile.profile_version,
+            "schema": {
+                "status": "DEGRADED",
+                "missing_fields": ["part_id"],
+            },
+        }
+
+    parts = [
+        _ood_v4_score_part(
+            profile,
+            group,
+            schema,
+        )
+        for _, group in d.groupby(
+            d["part_id"].astype(str),
+            sort=False,
+        )
+    ]
+
+    part_scores = np.asarray(
+        [
+            p["score"]
+            for p in parts
+        ],
+        dtype=float,
+    )
+
+    overall_score = float(
+        np.max(part_scores)
+        if part_scores.size
+        else 0.0
+    )
+
+    # ------------------------------------------------------------------
+    # Schema status is independent of OOD status.
+    # ------------------------------------------------------------------
+    missing_schema = sorted(
+        set(
+            _operational_schema(
+                profile.expected_columns
+            )
+        )
+        -
+        set(
+            _operational_schema(
+                schema
+            )
+        )
+    )
+
+    schema_status = (
+        "COMPLETE"
+        if not missing_schema
+        else "DEGRADED"
+    )
+
+    # ------------------------------------------------------------------
+    # Distribution statistics
+    # ------------------------------------------------------------------
+    q75 = float(
+        np.quantile(
+            part_scores,
+            0.75,
+        )
+        if part_scores.size
+        else 0.0
+    )
+
+    q95 = float(
+        np.quantile(
+            part_scores,
+            0.95,
+        )
+        if part_scores.size
+        else 0.0
+    )
+
+    severe_threshold = float(
+        profile.severe_threshold
+    )
+
+    moderate_threshold = float(
+        profile.moderate_threshold
+    )
+
+    severe_fraction = float(
+        np.mean(
+            part_scores >= severe_threshold
+        )
+        if part_scores.size
+        else 0.0
+    )
+
+    moderate_fraction = float(
+        np.mean(
+            part_scores >= moderate_threshold
+        )
+        if part_scores.size
+        else 0.0
+    )
+
+    # ------------------------------------------------------------------
+    # Semantic novelty
+    # ------------------------------------------------------------------
+    semantic_novel = any(
+        (
+            p.get("semantic_status") == "NOVEL"
+            or p.get("parameter_status") == "NOVEL"
+        )
+        for p in parts
+    )
+
+    # ------------------------------------------------------------------
+    # Context novelty prevalence
+    # ------------------------------------------------------------------
+    novel_context_parts = sum(
+        1
+        for p in parts
+        if (
+            p.get(
+                "components",
+                {},
+            ).get(
+                "test_method_novelty",
+                0.0,
+            ) >= 1.0
+            or
+            p.get(
+                "components",
+                {},
+            ).get(
+                "stress_novelty",
+                0.0,
+            ) >= 1.0
+        )
+    )
+
+    policy = load_yaml(
+        PROJECT_ROOT
+        / "configs"
+        / "policy.yaml"
+    )
+
+    dataset_policy = (
+        policy
+        .get("ood", {})
+        .get("dataset_status", {})
+    )
+
+    severe_fraction_min = float(
+        dataset_policy.get(
+            "severe_part_fraction_min",
+            0.05,
+        )
+    )
+
+    moderate_fraction_min = float(
+        dataset_policy.get(
+            "moderate_part_fraction_min",
+            0.10,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Dataset-level OOD decision
+    # ------------------------------------------------------------------
+    if semantic_novel:
+        dataset_status = "SEVERE"
+
+    elif (
+        q95 >= severe_threshold
+        and severe_fraction >= severe_fraction_min
+    ):
+        dataset_status = "SEVERE"
+
+    elif (
+        q75 >= moderate_threshold
+        and moderate_fraction >= moderate_fraction_min
+    ):
+        dataset_status = "MODERATE"
+
+    elif (
+        novel_context_parts
+        >= max(
+            3,
+            int(
+                np.ceil(
+                    0.10
+                    * max(
+                        len(parts),
+                        1,
+                    )
+                )
+            ),
+        )
+    ):
+        dataset_status = "MODERATE"
+
+    else:
+        # Isolated tails do not label the entire population as OOD.
+        dataset_status = "LOW"
+
     return {
-        "score": score,
-        "status": status,
+        "score": overall_score,
+        "status": dataset_status,
         "parts": parts,
         "profile_version": profile.profile_version,
         "schema_expected": profile.expected_columns,
-        "schema": {"status": "COMPLETE" if not missing else "DEGRADED", "missing_fields": missing}
+        "schema": {
+            "status": schema_status,
+            "missing_fields": missing_schema,
+        },
+        "distribution": {
+            "q75": q75,
+            "q95": q95,
+            "severe_fraction": severe_fraction,
+            "moderate_fraction": moderate_fraction,
+            "novel_context_parts": novel_context_parts,
+        },
     }
 
 
@@ -490,7 +1045,9 @@ def _extract_forecast_evidence(forecast: pd.DataFrame, part_id: str) -> dict[str
     widths = (hi - lo).abs() if len(lo) else pd.Series(dtype=float)
     rel_width = widths / pred.abs().replace(0, np.nan) if len(pred) else pd.Series(dtype=float)
     uncertainty = float(np.clip(rel_width.median(skipna=True) if rel_width.notna().any() else 1.0, 0, 1))
-    support = int(limit_cross) + int(near_limit) + int(failure_risk >= 0.60) + int("safety_slope_flag" in d.columns and pd.to_numeric(d["safety_slope_flag"], errors="coerce").fillna(0).max() > 0)
+    risk_thr = load_yaml(PROJECT_ROOT / "configs" / "policy.yaml").get("risk_score", {}).get("evidence_thresholds", {})
+    high_channel_min = float(risk_thr.get("high_channel_min", 0.60))
+    support = int(limit_cross) + int(near_limit) + int(failure_risk >= high_channel_min) + int("safety_slope_flag" in d.columns and pd.to_numeric(d["safety_slope_flag"], errors="coerce").fillna(0).max() > 0)
     return {
         "failure_risk": failure_risk,
         "uncertainty": uncertainty,
@@ -530,7 +1087,8 @@ def _combine_risk(a: dict[str, Any], f: dict[str, Any], ood: dict[str, Any], qua
     anomaly = float(a["anomaly_risk"])
     failure = float(f["failure_risk"])
     combined = max(anomaly, failure)
-    if anomaly >= 0.60 and failure >= 0.60:
+    joint_thr = float(load_yaml(PROJECT_ROOT / "configs" / "policy.yaml").get("risk_score", {}).get("evidence_thresholds", {}).get("joint_high_min", 0.60))
+    if anomaly >= joint_thr and failure >= joint_thr:
         combined = min(1.0, combined + 0.12)
     if a["absolute_violation"]:
         combined = 1.0
@@ -540,13 +1098,94 @@ def _combine_risk(a: dict[str, Any], f: dict[str, Any], ood: dict[str, Any], qua
 
 
 def _human_confidence(risk: float, uncertainty: float, ood_score: float, quality: float) -> str:
-    if quality < 0.60 or uncertainty >= 0.70 or ood_score >= 0.75:
+    cfg = load_yaml(PROJECT_ROOT / "configs" / "policy.yaml")
+    ct = cfg.get("confidence_thresholds", {}) if isinstance(cfg, dict) else {}
+    low_quality_min = float(ct.get("low_quality_min", 0.60))
+    high_u = float(ct.get("high_uncertainty_max", 0.30))
+    moderate_u = float(ct.get("moderate_uncertainty_max", 0.70))
+    if quality < low_quality_min or uncertainty >= moderate_u or ood_score >= 0.75:
         return "LOW"
-    if uncertainty >= 0.40 or ood_score >= 0.40:
+    if uncertainty >= high_u or ood_score >= 0.40:
         return "MODERATE"
     if risk >= 0.80 or risk <= 0.20:
         return "HIGH"
     return "MODERATE"
+
+
+def _load_runtime_policy(policy_path: str | Path | None = None) -> dict[str, Any]:
+    """Load YAML policy, then overlay the frozen validation-calibrated runtime thresholds.
+
+    The calibrated artifact is deliberately separate from the normative YAML so that
+    engineering defaults are not silently mistaken for measured operating thresholds.
+    """
+    base = load_yaml(policy_path or (PROJECT_ROOT / "configs" / "policy.yaml"))
+    if policy_path is not None:
+        return base
+    cal_path = PROJECT_ROOT / "models" / "calibration" / "safety_policy.json"
+    if not cal_path.exists():
+        return base
+    try:
+        payload = json.loads(cal_path.read_text(encoding="utf-8"))
+        thr = payload.get("thresholds", {})
+        if "risk_score" not in base:
+            base["risk_score"] = {"thresholds": {}}
+        base["risk_score"].setdefault("thresholds", {}).update({
+            k: float(v) for k, v in thr.items()
+            if k in {"safe_max", "review_max", "reject_min"} and v is not None
+        })
+        base.setdefault("calibration", {})
+        base["calibration"].update({
+            "artifact": str(cal_path),
+            "selection_split": payload.get("selection_split", "validation"),
+            "optimization": payload.get("optimization", {}),
+        })
+    except Exception:
+        # A malformed optional calibration must never make the core YAML policy unreadable.
+        pass
+    return base
+
+
+def _decision_from_trace_dict(trace: Mapping[str, Any], policy: Mapping[str, Any], part_id: str,
+                              high_but_safe: bool = False, measurement_only_anomaly: bool = False) -> ScreeningAssessment:
+    """Re-apply only the decision policy to an already-computed evidence trace."""
+    a = dict(trace.get("module_a", {}) or {})
+    f = dict(trace.get("module_b", {}) or {})
+    o = dict(trace.get("ood", {}) or {})
+    q = dict(trace.get("data_quality", {}) or {})
+    return _decision_for_case(part_id, {**a, "high_but_safe": high_but_safe, "measurement_only_anomaly": measurement_only_anomaly}, f, o, q, policy)
+
+
+def redecide_screening(screening: pd.DataFrame, *, safe_max: float, reject_min: float,
+                       policy_path: str | Path | None = None) -> pd.DataFrame:
+    """Re-apply a candidate risk operating point without recomputing model evidence.
+
+    This is used exclusively by validation-time threshold search. It avoids accidentally
+    recalibrating OOD/model evidence on the test set while making the deployed policy
+    exactly reproducible.
+    """
+    policy = _load_runtime_policy(policy_path)
+    policy = json.loads(json.dumps(policy))
+    policy.setdefault("risk_score", {}).setdefault("thresholds", {})
+    policy["risk_score"]["thresholds"].update({"safe_max": float(safe_max), "reject_min": float(reject_min), "review_max": float(reject_min)})
+    rows = []
+    for _, row in screening.iterrows():
+        trace = row.get("trace_json", {})
+        if isinstance(trace, str):
+            try:
+                trace = json.loads(trace)
+            except Exception:
+                trace = {}
+        assessment = _decision_from_trace_dict(trace, policy, str(row.get("part_id")),
+                                              bool(row.get("high_but_safe", False)),
+                                              bool(row.get("measurement_only_anomaly", False)))
+        rows.append(asdict(assessment))
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["reasons_json"] = out["reasons"].apply(json.dumps)
+        out["warnings_json"] = out["warnings"].apply(json.dumps)
+        out["trace_json"] = out["trace"].apply(lambda x: json.dumps(x, default=str))
+        out = out.drop(columns=["reasons", "warnings", "trace"])
+    return out
 
 
 def _decision_for_case(part_id: str, anomaly_e: dict[str, Any], forecast_e: dict[str, Any], ood_e: dict[str, Any], quality_e: dict[str, Any], policy: Mapping[str, Any]) -> ScreeningAssessment:
@@ -612,7 +1251,7 @@ def _decision_for_case(part_id: str, anomaly_e: dict[str, Any], forecast_e: dict
         "ood": {k: v for k, v in ood_e.items() if k != "parts"},
         "data_quality": quality_e,
         "fusion": {"combined_risk": combined, "supporting_evidence_count": support, "uncertainty": uncertainty},
-        "policy": {"safe_max": safe_max, "reject_min": reject_min, "hard_limit_override": hard_limit},
+        "policy": {"safe_max": safe_max, "reject_min": reject_min, "hard_limit_override": hard_limit, "calibration": policy.get("calibration", {})},
     }
     return ScreeningAssessment(
         part_id=str(part_id), decision=decision, risk_score=combined, confidence=confidence,
@@ -633,7 +1272,7 @@ def assess_screening(
     ood_profile: OODProfileV4 | None = None,
     policy_path: str | Path | None = None
 ) -> pd.DataFrame:
-    policy = load_yaml(policy_path or (PROJECT_ROOT / "configs" / "policy.yaml"))
+    policy = _load_runtime_policy(policy_path)
     if "part_id" not in input_df.columns:
         raise ValueError("Safety assessment requires part_id in input data")
     if ood_profile is None:
@@ -701,3 +1340,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

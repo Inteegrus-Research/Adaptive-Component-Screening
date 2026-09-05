@@ -268,28 +268,29 @@ class Canonicalizer:
         row["raw_parameter"] = _text(raw_parameter)
         spec, method, ambiguity = self.ontology.resolve(raw_parameter)
         
-        # TRUE UNIVERSALITY FALLBACK: If parameter is unknown, DO NOT drop or quarantine. Treat as autonomous generic.
+        # Unknown/ambiguous semantics are quarantined rather than guessed. The raw
+        # identifier remains in raw_parameter and downstream safety maps this to UNKNOWN.
         if spec is None:
             numeric, censor = self._numeric_and_censor(raw_value)
             explicit = self._unit(raw_unit)
             suffix = self._suffix_unit(raw_parameter)
-            row["mapping_method"] = "autonomous_fallback"
-            row["parameter"] = _norm(raw_parameter)
-            row["semantic_type"] = "generic_electrical_parameter"
-            row["physical_quantity"] = "continuous_numeric"
+            row["mapping_method"] = method
+            row["parameter"] = None
+            row["semantic_type"] = None
+            row["physical_quantity"] = None
             row["time_h"] = time_h
             row["value"] = numeric
             row["value_original"] = raw_value if not pd.isna(raw_value) else None
             row["raw_unit"] = explicit or suffix or "raw_units"
             row["unit"] = explicit or suffix or "raw_units"
             row["unit_conversion_factor"] = 1.0
-            row["unit_source"] = "autonomous_fallback"
+            row["unit_source"] = "unresolved"
             row["censoring"] = censor
             status = _text(raw[cols["measurement_status"]] if "measurement_status" in cols else None)
             if status: row["measurement_status"] = {"PASS": "VALID", "OK": "VALID", "FAIL": "FAILED_TEST"}.get(status.upper(), status.upper())
             else: row["measurement_status"] = "MISSING" if math.isnan(numeric) and censor == "NONE" else "VALID"
-            row["quality_flag"] = "OK" if row["measurement_status"] == "VALID" else "LIMITED"
-            row["quality_detail"] = "autonomous_fallback"
+            row["quality_flag"] = "ERROR"
+            row["quality_detail"] = "unresolved_semantic_mapping"
             row["observation_id"] = self._observation_id(row)
             return row
 
@@ -341,8 +342,23 @@ class Canonicalizer:
         cols = profile.columns
         if profile.source_format == "long":
             elapsed = pd.to_numeric(df[cols["time_h"]], errors="coerce") if "time_h" in cols else None
+            timestamps = pd.to_datetime(df[cols["timestamp"]], errors="coerce") if "timestamp" in cols else None
+            inferred0 = {}
+            if elapsed is None and timestamps is not None:
+                part_col = cols.get("part_id")
+                for key, ix in df.groupby(df[part_col].astype(str) if part_col else pd.Series("PART", index=df.index)).groups.items():
+                    ts = timestamps.loc[ix]
+                    first = ts.dropna().min() if ts.notna().any() else pd.NaT
+                    if pd.notna(first): inferred0[key] = first
             for idx, raw in df.iterrows():
-                t = _float(elapsed.loc[idx]) if elapsed is not None else math.nan
+                if elapsed is not None:
+                    t = _float(elapsed.loc[idx])
+                elif timestamps is not None and pd.notna(timestamps.loc[idx]):
+                    key = str(raw[cols["part_id"]]) if "part_id" in cols else "PART"
+                    base_ts = inferred0.get(key, timestamps.loc[idx])
+                    t = float((timestamps.loc[idx] - base_ts).total_seconds() / 3600.0)
+                else:
+                    t = math.nan
                 base = self._base(raw, cols, source_file, int(idx) + 1, "long")
                 rows.append(self._one(base, raw, cols, raw[cols["parameter"]], raw[cols["value"]], raw[cols["unit"]] if "unit" in cols else None, t, cols["value"]))
             result = pd.DataFrame(rows, columns=CANONICAL_COLUMNS)
@@ -403,3 +419,10 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+# Stable ontology regression-test helper.
+def alias_demo() -> pd.DataFrame:
+    return pd.DataFrame({"raw_parameter": ["IDDQ", "I_DDQ", "QUIESCENT_CURRENT"],
+                         "canonical_parameter": ["quiescent_current"] * 3})

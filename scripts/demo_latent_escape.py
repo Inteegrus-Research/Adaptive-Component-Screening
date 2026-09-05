@@ -1,72 +1,126 @@
 #!/usr/bin/env python3
-"""Latent Escape Counterfactual Demonstration.
+"""Honest local sensitivity/counterfactual demo for latent-escape candidates.
 
-Proves the decision engine relies on physical precursor boundaries, not black-box noise,
-by programmatically perturbing a 24h reading back toward its 0h baseline until SAFE.
+The script perturbs only the requested observed parameter toward its 0 h baseline,
+re-runs the real pipeline, reports channel-level evidence and finds the smallest
+observed-value change that changes the disposition. It never claims causal proof.
 """
-import argparse
-import pandas as pd
-from pathlib import Path
-import sys
-import os
+from __future__ import annotations
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import argparse
+import json
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.pipeline import screen_dataframe, _default_paths
 
-def run_counterfactual_demo(input_path: str, output_dir: str, part_id: str, parameter: str):
+
+def _pick_column(df: pd.DataFrame, token: str) -> str:
+    exact = [c for c in df.columns if str(c).lower() == token.lower()]
+    if exact:
+        return exact[0]
+    raise ValueError(f"Required column {token!r} not found")
+
+
+def _first_finite(df: pd.DataFrame, col: str) -> float | None:
+    if col not in df.columns:
+        return None
+    x = pd.to_numeric(df[col], errors="coerce").dropna()
+    return float(x.iloc[0]) if len(x) else None
+
+
+def _summary(row: pd.Series) -> dict:
+    trace = row.get("trace_json", {})
+    if isinstance(trace, str):
+        try: trace = json.loads(trace)
+        except Exception: trace = {}
+    a = trace.get("module_a", {}) or {}
+    f = trace.get("module_b", {}) or {}
+    o = trace.get("ood", {}) or {}
+    return {
+        "decision": str(row.get("decision")),
+        "risk_score": float(row.get("risk_score", 0.0)),
+        "population_evidence": float(a.get("population", a.get("population_evidence", 0.0))),
+        "temporal_evidence": float(a.get("temporal", a.get("temporal_evidence", 0.0))),
+        "multivariate_evidence": float(a.get("multivariate", a.get("multivariate_component_score", 0.0))),
+        "failure_risk": float(f.get("failure_risk", 0.0) or 0.0),
+        "ood_score": float(o.get("score", 0.0) or 0.0),
+        "ood_status": str(o.get("status", "UNKNOWN")),
+    }
+
+
+def run_counterfactual_demo(input_path: str, output_dir: str, part_id: str, parameter: str, steps: int = 25) -> None:
     df = pd.read_csv(input_path, low_memory=False)
-    part_df = df[(df["part_id"].astype(str) == part_id)].copy()
+    part_df = df[df["part_id"].astype(str).eq(str(part_id))].copy()
     if part_df.empty:
-        raise ValueError(f"Part {part_id} not found in dataset.")
-        
-    outdir = Path(output_dir) / "counterfactual_demo"
-    outdir.mkdir(parents=True, exist_ok=True)
-    
+        raise ValueError(f"Part {part_id} not found.")
+    if "parameter" in part_df.columns:
+        hit = part_df[part_df["parameter"].astype(str).str.lower().eq(str(parameter).lower())]
+        if len(hit): part_df = hit.copy()
+    value_col = _pick_column(part_df, "value_24h")
+    base_col = _pick_column(part_df, "value_0h")
+    if len(part_df) != 1:
+        # Wide benchmark rows are normally one parameter per part. Select the requested parameter deterministically.
+        if "parameter" in part_df.columns:
+            hit = part_df[part_df["parameter"].astype(str).str.lower().eq(str(parameter).lower())]
+            if len(hit) == 1: part_df = hit.copy()
+        if len(part_df) != 1:
+            raise ValueError("Counterfactual demo requires exactly one row for the selected part/parameter.")
+
+    original = _first_finite(part_df, value_col); baseline = _first_finite(part_df, base_col)
+    if original is None or baseline is None:
+        raise ValueError("Selected parameter needs finite value_0h and value_24h observations.")
+
+    outdir = Path(output_dir) / "counterfactual_demo"; outdir.mkdir(parents=True, exist_ok=True)
     artifacts = _default_paths()
     base_run = screen_dataframe(part_df, outdir / "baseline", artifacts=artifacts, as_of_h=24.0, render_explanations=True)
-    base_decision = base_run.screening["decision"].iloc[0]
-    
-    print(f"--- Counterfactual Demo: {part_id} ---")
-    print(f"Baseline Decision at 24h: {base_decision}")
-    if base_decision == "SAFE":
-        print("Part is already SAFE. Choose a latent defect currently flagged as REVIEW or REJECT.")
-        return
+    base = _summary(base_run.screening.iloc[0])
 
-    val_col = next((c for c in part_df.columns if c.startswith("value_24h") or c.endswith("24h")), None)
-    baseline_col = next((c for c in part_df.columns if c.startswith("value_0h") or c.endswith("0h")), None)
-    
-    original_value = float(part_df[val_col].iloc[0])
-    baseline_value = float(part_df[baseline_col].iloc[0]) if baseline_col else (original_value * 0.8)
-    
-    print(f"Original {parameter} at 24h: {original_value:.4f} (0h Baseline: {baseline_value:.4f})")
-    
-    current_value = original_value
-    # Step incrementally from the anomalous 24h reading back toward the healthy 0h reading
-    step_size = (original_value - baseline_value) / 50.0 
-    
-    for step in range(1, 51):
-        current_value -= step_size
-        test_df = part_df.copy()
-        test_df[val_col] = current_value
-        
-        run = screen_dataframe(test_df, outdir / f"step_{step}", artifacts=artifacts, as_of_h=24.0, render_explanations=False)
-        decision = run.screening["decision"].iloc[0]
-        risk = run.screening["risk_score"].iloc[0]
-        
-        print(f"Step {step} | Simulated 24h Value: {current_value:.4f} | Risk: {risk:.3f} | Decision: {decision}")
-        
-        if decision == "SAFE":
-            print("\n>>> BOUNDARY FOUND <<<")
-            print(f"If the 24h {parameter} drift had been contained to {current_value:.4f},")
-            print(f"the overall risk score drops to {risk:.3f}.")
-            print("The system physically clears this latent defect as SAFE.")
-            break
+    print(f"--- Counterfactual Sensitivity: {part_id} / {parameter} ---")
+    print(f"Baseline disposition at 24 h: {base['decision']}")
+    print(f"Original 24 h value: {original:.6g}; 0 h baseline: {baseline:.6g}")
+    print("This is an empirical one-variable sensitivity test, not a causal proof.\n")
+
+    values = np.linspace(original, baseline, int(steps) + 1)[1:]
+    records = []
+    transition = None
+    for i, value in enumerate(values, 1):
+        trial = part_df.copy(); trial[value_col] = float(value)
+        run = screen_dataframe(trial, outdir / f"step_{i:02d}", artifacts=artifacts, as_of_h=24.0, render_explanations=False)
+        row = run.screening.iloc[0]
+        m = _summary(row); m["step"] = i; m["value_24h"] = float(value); m["delta_from_original"] = float(value-original)
+        records.append(m)
+        print(f"step={i:02d} value={value:.6g} risk={m['risk_score']:.4f} population={m['population_evidence']:.4f} temporal={m['temporal_evidence']:.4f} multi={m['multivariate_evidence']:.4f} OOD={m['ood_score']:.4f} decision={m['decision']}")
+        if m["decision"] != base["decision"] and transition is None:
+            transition = m
+
+    result = {"part_id": part_id, "parameter": parameter, "baseline": base, "transition": transition, "records": records}
+    pd.DataFrame(records).to_csv(outdir / "sensitivity_curve.csv", index=False)
+    (outdir / "counterfactual_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+    print()
+    if transition:
+        print(">>> DECISION BOUNDARY FOUND <<<")
+        print(f"A simulated 24 h value of {transition['value_24h']:.6g} changed the disposition from {base['decision']} to {transition['decision']}.")
+        print(f"Risk: {base['risk_score']:.4f} -> {transition['risk_score']:.4f}")
+        print("Channel evidence changed as follows:")
+        for k in ("population_evidence", "temporal_evidence", "multivariate_evidence", "failure_risk", "ood_score"):
+            print(f"  {k}: {base[k]:.4f} -> {transition[k]:.4f}")
+        print(f"If the 24 h {parameter} measurement had been approximately {transition['value_24h']:.6g}, the actual policy would have produced {transition['decision']} under the same artifacts.")
+    else:
+        print("No disposition transition occurred in the requested sweep.")
+        print("The result should be interpreted by inspecting which evidence channel remains dominant; a flat aggregate score is not proof that the perturbed variable is irrelevant.")
+
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Path to test dataset")
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
     ap.add_argument("--output-dir", default="reports/demo")
-    ap.add_argument("--part-id", required=True, help="Part ID of a known latent defect")
-    ap.add_argument("--parameter", default="leakage_current", help="Parameter to perturb")
-    args = ap.parse_args()
-    run_counterfactual_demo(args.input, args.output_dir, args.part_id, args.parameter)
+    ap.add_argument("--part-id", required=True)
+    ap.add_argument("--parameter", required=True)
+    ap.add_argument("--steps", type=int, default=25)
+    args=ap.parse_args()
+    run_counterfactual_demo(args.input, args.output_dir, args.part_id, args.parameter, args.steps)

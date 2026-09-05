@@ -1009,3 +1009,13 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+# Backward-compatible public test helpers retained for repository consumers.
+def _canonicalize_state(df: pd.DataFrame, as_of_h: float = 24.0) -> pd.DataFrame:
+    return _wide_state(df, as_of_h)
+
+
+def _robust_lot_features(df: pd.DataFrame) -> pd.DataFrame:
+    return _lot_robust(df, "value_asof")

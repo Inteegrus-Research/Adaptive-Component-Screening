@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Mapping
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -191,7 +192,8 @@ def explain_row(row: pd.Series, feature_row: Mapping[str, Any] | None = None) ->
     if _num(a.get("multivariate", a.get("multivariate_component_score"))) >= 0.50:
         findings.append(f"Cross-parameter novelty detected (evidence score: {_num(a.get('multivariate', a.get('multivariate_component_score'))):.2f}).")
     if f.get("target_available") or f.get("max_prediction") is not None:
-        findings.append(f"168 h drift forecast: {_format(f.get('max_prediction'), unit)} (90% conformal interval: [{_format(f.get('max_prediction', 0) - f.get('uncertainty', 0), unit)}, {_format(f.get('max_upper'), unit)}]).")
+        nominal = _num(f.get("nominal_interval_coverage", 0.95), 0.95) * 100.0
+        findings.append(f"168 h drift forecast: {_format(f.get('max_prediction'), unit)} ({nominal:.0f}% conformal interval: [{_format(f.get('max_prediction', 0) - f.get('uncertainty', 0), unit)}, {_format(f.get('max_upper'), unit)}]).")
     if f.get("limit_cross"):
         findings.append("The upper forecast bound projects a critical engineering limit exceedance by 168 h.")
     if o.get("status") in {"MODERATE", "SEVERE"}:
@@ -352,3 +354,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

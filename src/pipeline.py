@@ -19,7 +19,7 @@ import pandas as pd
 
 from src.anomaly import fit_anomaly, load_anomaly_model, score_anomaly
 from src.explain import render_report
-from src.features import FeatureEngine, validate_features
+from src.features import FeatureEngine, validate_features, feature_availability_manifest
 from src.forecast import fit_forecast, load_forecast_model, predict_forecast
 from src.ingest import canonicalize_csv, profile_csv, validate_canonical
 from src.safety import assess_screening, fit_ood_profile, load_ood_profile
@@ -126,18 +126,25 @@ def _model_input_from_canonical(canonical: pd.DataFrame, *, as_of_h: float = 24.
     if "value_0h" not in wide.columns:
         wide["value_0h"] = np.nan
         
-    # VARIABLE HORIZON FIX: If exact 24h isn't there, pick latest prior to as_of_h
+    # Compatibility alias: when a nearest pre-24h measurement exists, expose it as
+    # value_24h for legacy consumers but mark it as a proxy. Forecast code ignores
+    # proxy readpoints, so this never becomes a fabricated 24 h observation.
     if "value_24h" not in wide.columns:
         pre = [(t, c) for t, c in time_cols if 0 < t <= min(24.0, float(as_of_h))]
         if pre:
             latest_t, src = max(pre, key=lambda x: x[0])
             wide["value_24h"] = wide[src]
-            wide["adapted_forecast_origin"] = 1
+            wide["value_24h_is_proxy"] = 1 if abs(latest_t - 24.0) > 1e-9 else 0
         else:
-            wide["value_24h"] = wide["value_0h"]
-            wide["adapted_forecast_origin"] = 1
-            
-    wide["adapted_forecast_origin"] = wide.get("adapted_forecast_origin", 0)
+            wide["value_24h"] = np.nan
+            wide["value_24h_is_proxy"] = 1
+    else:
+        wide["value_24h_is_proxy"] = 0
+    wide["adapted_forecast_origin"] = wide.get("value_24h_is_proxy", 0).astype(int)
+    # Compatibility/evaluation placeholder only. It is NaN by construction and
+    # is never included in forecast supervised features.
+    if "target_168h" not in wide.columns:
+        wide["target_168h"] = np.nan
     return wide
 
 
@@ -277,6 +284,8 @@ def screen_file(
         manifest = {
             "source": source_file, "source_profile": source_profile, "as_of_h": float(as_of_h), "target_horizon_h": float(target_horizon),
             "forecast_origin_policy": "last observed readpoint <= as_of_h",
+            "feature_availability_policy": "history-dependent features remain unavailable until enough observed readpoints exist; missing values are never backfilled with future data",
+            "feature_availability": feature_availability_manifest(canonical, as_of_h=as_of_h),
             "rows": {"raw": int(len(raw)), "canonical": int(len(canonical)), "features": int(len(features)), "anomaly": int(len(anomaly)), "forecast": int(len(forecast)), "screening": int(len(screening))},
             "artifacts": {k: str(v) for k, v in artifacts.__dict__.items()},
             "decisions": screening["decision"].value_counts(dropna=False).to_dict() if "decision" in screening.columns else {},
@@ -333,3 +342,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

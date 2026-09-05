@@ -23,8 +23,22 @@ rm -f models/calibration/safety_policy.json
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 python -m src.anomaly train data/processed/module_A_dataset.csv "$TMP/anomaly.joblib" --as-of 24
 # One universal model is trained over all target horizons used by the generator.
-python -m src.forecast train data/processed/module_B_drift_full.csv "$TMP/forecast.joblib" --horizon 168 --as-of 24 --target-horizons 48,96,168,240,300
-python -m src.safety fit-ood data/processed/module_A_dataset.csv "$TMP/ood_profile.joblib"
+python -m src.forecast train data/processed/module_B_drift_full.csv "$TMP/forecast.joblib" --horizon 168 --as-of 24 --target-horizons 168
+export SIH_OOD_TMP="$TMP"
+python - <<'PY'
+from pathlib import Path
+import os
+import pandas as pd
+src=Path('data/processed/module_A_dataset.csv')
+df=pd.read_csv(src, low_memory=False)
+if 'split' not in df.columns:
+    raise SystemExit('module_A_dataset.csv must contain train/val/test split labels for leakage-safe OOD calibration')
+train=df[df['split'].astype(str).eq('train')].copy()
+out=Path(os.environ['SIH_OOD_TMP'])/'ood_train_reference.csv'
+train.to_csv(out,index=False)
+print(f'OOD TRAIN-ONLY reference: rows={len(train)} lots={train.lot_id.nunique() if "lot_id" in train.columns else "NA"}')
+PY
+python -m src.safety fit-ood "$TMP/ood_train_reference.csv" "$TMP/ood_profile.joblib"
 mv "$TMP/anomaly.joblib" models/anomaly/model.joblib
 mv "$TMP/anomaly.joblib.manifest.json" models/anomaly/model.joblib.manifest.json
 mv "$TMP/forecast.joblib" models/forecast/model.joblib
@@ -54,7 +68,9 @@ elif 'defect_state' in val.columns:
 else:
     raise SystemExit('No future_defective_168h or legacy defect_state label in validation data')
 s=s.merge(labels[['part_id','future_defective']],on='part_id',how='left')
-payload=calibrate_safety_policy(s, output_path=PROJECT_ROOT/'models'/'calibration'/'safety_policy.json', fn_cost=100.0, fp_cost=1.0, max_reject_rate=0.25)
+if 'absolute_fail_168h' in s.columns:
+    s['latent_escape_target']=((pd.to_numeric(s['absolute_fail_168h'],errors='coerce').fillna(0).astype(int)==0) & (s['future_defective']==1)).astype(int)
+payload=calibrate_safety_policy(s, output_path=PROJECT_ROOT/'models'/'calibration'/'safety_policy.json', fn_cost=100.0, fp_cost=1.0, max_reject_rate=0.25, target_metric="escape_recall")
 print('SAFETY POLICY CALIBRATED ON VALIDATION LOTS ONLY')
 print(payload['optimization'])
 PY
@@ -70,3 +86,5 @@ print('SAFETY POLICY:', Path('models/calibration/safety_policy.json').exists())
 PY
 echo "RELEASE-RETRAIN COMPLETE"
 echo "Previous artifacts backed up under: $backup"
+
+

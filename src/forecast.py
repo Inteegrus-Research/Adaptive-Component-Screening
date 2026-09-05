@@ -104,6 +104,8 @@ def _available_points(row: pd.Series, as_of_h: float) -> tuple[np.ndarray, np.nd
     pts: list[tuple[float, float]] = []
     for t, c in _value_columns(row.to_frame().T):
         if t > float(as_of_h): continue
+        if c == "value_24h" and bool(row.get("value_24h_is_proxy", 0)):
+            continue
         v = pd.to_numeric(pd.Series([row.get(c)]), errors="coerce").iloc[0]
         if pd.notna(v): pts.append((float(t), float(v)))
     pts.sort()
@@ -271,13 +273,12 @@ def _build_examples(df: pd.DataFrame, horizons: Sequence[float], as_of_h: float)
     rows: list[dict[str, Any]] = []; targets: list[float] = []; meta: list[dict[str, Any]] = []
     lot_stats = _lot_reference_stats(df, as_of_h)
     target_candidates = [h for h in horizons if horizon_column("target", h) in df.columns]
-    if not target_candidates: target_candidates = [h for h in horizons if horizon_column("value", h) in df.columns]
-    if not target_candidates: raise ValueError("Forecast training requires observed target_<h>h or value_<h>h columns.")
+    if not target_candidates: raise ValueError("Forecast training requires observed target_<h>h columns; value_<h>h and latent_<h>h are never used as supervised targets.")
     for idx, row in df.iterrows():
         baseline = pd.to_numeric(pd.Series([row.get("value_0h", np.nan)]), errors="coerce").iloc[0]
         if not np.isfinite(baseline) or abs(float(baseline)) <= 1e-12: continue
         for h in target_candidates:
-            target_col = horizon_column("target", h) if horizon_column("target", h) in df.columns else horizon_column("value", h)
+            target_col = horizon_column("target", h)
             y_abs = pd.to_numeric(pd.Series([row.get(target_col)]), errors="coerce").iloc[0]
             if pd.isna(y_abs): continue
             feat = _feature_row(df, row, as_of_h=as_of_h, target_horizon_h=h, lot_stats=lot_stats)
@@ -368,8 +369,8 @@ def fit_forecast(
     Xtr, ytr, meta_tr = _build_examples(train, horizons, as_of_h)
     Xv, yv, meta_v = _build_examples(val, horizons, as_of_h) if len(val) else (pd.DataFrame(columns=Xtr.columns), np.array([]), pd.DataFrame())
 
-    numeric = [c for c in UNIVERSAL_NUMERIC if c in Xtr.columns]
-    categorical = [c for c in CATEGORICAL if c in Xtr.columns]
+    numeric = [c for c in UNIVERSAL_NUMERIC if c in Xtr.columns and Xtr[c].notna().any()]
+    categorical = [c for c in CATEGORICAL if c in Xtr.columns and Xtr[c].notna().any()]
     feature_cols = numeric + categorical
     if len(ytr) < 10: raise ValueError("Not enough supervised forecast examples to fit a model.")
 
@@ -393,15 +394,9 @@ def fit_forecast(
         slope = Xv["last_slope"].fillna(0.0).to_numpy(float); dt = Xv["relative_horizon_h"].to_numpy(float)
         p_linear = p_persist + slope * dt; metrics["linear"] = _metric(yv_abs, p_linear)
 
-        # Composite score (MAE + RMSE) to heavily penalize large catastrophic misses (where Persistence fails)
-        composite_scores = {
-            "gradient_boosting": 0.5 * metrics["gradient_boosting"]["mae"] + 0.5 * metrics["gradient_boosting"]["rmse"],
-            "ridge": 0.5 * metrics["ridge"]["mae"] + 0.5 * metrics["ridge"]["rmse"]
-        }
-        selected = min(["gradient_boosting", "ridge"], key=lambda k: composite_scores[k] if metrics[k]["mae"] is not None else float("inf"))
-        
-        baseline_composite = 0.5 * metrics["persistence"]["mae"] + 0.5 * metrics["persistence"]["rmse"]
-        if composite_scores[selected] > baseline_composite: selected = "persistence"
+        # Competition objective is 168 h MAE. RMSE is only the tie-breaker.
+        eligible = [k for k, v in metrics.items() if v.get("mae") is not None]
+        selected = min(eligible, key=lambda k: (float(metrics[k]["mae"]), float(metrics[k].get("rmse") or np.inf)))
     else: selected = "gradient_boosting"
 
     if selected == "ridge": chosen_rel = ridge.predict(Xv[feature_cols])
@@ -414,8 +409,8 @@ def fit_forecast(
     if len(yv):
         for h in horizons:
             m = np.isfinite(yv_abs) & np.isclose(meta_v["target_horizon_h"].to_numpy(float), h)
-            if m.any(): per_h[_horizon_token(h)] = _conformal(yv_abs[m], chosen_val[m], 0.90)
-    base_q = float(np.median(list(per_h.values()))) if per_h else _conformal(yv, chosen_val, 0.90) if len(yv) else 0.0
+            if m.any(): per_h[_horizon_token(h)] = _conformal(yv_abs[m], chosen_val[m], 0.95)
+    base_q = float(np.median(list(per_h.values()))) if per_h else _conformal(yv_abs, chosen_val, 0.95) if len(yv_abs) else 0.0
     rs = float(np.median(residuals)) if len(residuals) else 0.0
 
     model = ForecastModel(
@@ -488,9 +483,18 @@ def predict_forecast(
         else: base = float(model.conformal_quantile)
         q = base * math.sqrt(max(target, 1.0) / base_h)
     q = float(q)
+    trained = [float(h) for h in (model.training_horizons or [])]
+    if not trained:
+        horizon_status = "UNKNOWN"
+    elif any(abs(target - h) < 1e-9 for h in trained):
+        horizon_status = "SUPPORTED"
+    elif min(trained) <= target <= max(trained):
+        horizon_status = "INTERPOLATED"
+    else:
+        horizon_status = "EXTRAPOLATED"
 
     out = d.copy()
-    out["target_horizon_h"] = target; out["forecast_origin_h"] = d["forecast_origin_h"].astype(float); out["forecast_relative_horizon_h"] = target - out["forecast_origin_h"]
+    out["target_horizon_h"] = target; out["horizon_status"] = horizon_status; out["forecast_origin_h"] = d["forecast_origin_h"].astype(float); out["forecast_relative_horizon_h"] = target - out["forecast_origin_h"]
     out["selected_forecast_model"] = model.selected_model; out["prediction_persistence"] = baseline_arr[:, 0] if len(baseline_arr) else np.array([])
     out["prediction_linear"] = baseline_arr[:, 1] if len(baseline_arr) else np.array([])
     out["prediction_ridge"] = ridge; out["prediction_gradient_boosting"] = primary
@@ -538,24 +542,29 @@ def _linear(df: pd.DataFrame, horizon_h: float = 168.0) -> np.ndarray:
 
 def evaluate_forecast(reference: pd.DataFrame, pred: pd.DataFrame, *, target_horizon: float = 168.0) -> dict[str, Any]:
     target_col = horizon_column("target", target_horizon)
-    if target_col not in reference.columns: target_col = horizon_column("value", target_horizon)
-    if target_col not in reference.columns: target_col = "target_168h"
+    if target_col not in reference.columns:
+        raise ValueError(f"Observed {target_col} is required for forecast evaluation; value_<h> is not accepted as a substitute.")
     pred_col = "prediction_" + _horizon_token(target_horizon) + "h"
-    if pred_col not in pred.columns: pred_col = "prediction_168h"
-    y = pd.to_numeric(reference[target_col], errors="coerce").to_numpy(float); p = pd.to_numeric(pred[pred_col], errors="coerce").to_numpy(float)
-    m = np.isfinite(y) & np.isfinite(p); out = _metric(y[m], p[m])
+    if pred_col not in pred.columns:
+        raise ValueError(f"Prediction column {pred_col} not found")
+    y = pd.to_numeric(reference[target_col], errors="coerce").to_numpy(float)
+    p = pd.to_numeric(pred[pred_col], errors="coerce").to_numpy(float)
+    m = np.isfinite(y) & np.isfinite(p)
+    out = _metric(y[m], p[m])
     if "prediction_lower" in pred.columns and "prediction_upper" in pred.columns:
-        lo = pd.to_numeric(pred["prediction_lower"], errors="coerce").to_numpy(float); hi = pd.to_numeric(pred["prediction_upper"], errors="coerce").to_numpy(float)
+        lo = pd.to_numeric(pred["prediction_lower"], errors="coerce").to_numpy(float)
+        hi = pd.to_numeric(pred["prediction_upper"], errors="coerce").to_numpy(float)
         ok = m & np.isfinite(lo) & np.isfinite(hi)
         out["conformal_coverage"] = float(np.mean((y[ok] >= lo[ok]) & (y[ok] <= hi[ok]))) if ok.any() else None
         out["mean_interval_width"] = float(np.mean(hi[ok] - lo[ok])) if ok.any() else None
     out["target_horizon_h"] = float(target_horizon)
+    out["nominal_interval_coverage"] = 0.95
     return out
 
 
 def benchmark_forecast(reference: pd.DataFrame, pred: pd.DataFrame, *, target_horizon: float = 168.0) -> pd.DataFrame:
-    target_col = horizon_column("target", target_horizon) if horizon_column("target", target_horizon) in reference.columns else horizon_column("value", target_horizon)
-    if target_col not in reference.columns: target_col = "target_168h"
+    target_col = horizon_column("target", target_horizon)
+    if target_col not in reference.columns: raise ValueError(f"Observed {target_col} is required for benchmark evaluation")
     y = pd.to_numeric(reference[target_col], errors="coerce").to_numpy(float); m = np.isfinite(y)
     names = [("ridge", "prediction_ridge"), ("gradient_boosting", "prediction_gradient_boosting"), ("persistence", "prediction_persistence"), ("linear", "prediction_linear"), ("selected", "prediction_" + _horizon_token(target_horizon) + "h")]
     rows: list[dict[str, Any]] = []
@@ -588,3 +597,25 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+# Backward-compatible test helpers. They are thin wrappers around the same
+# leakage-safe feature/baseline implementations used by the production path.
+def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    if "value_0h" in d.columns and "value_24h" in d.columns:
+        v0 = pd.to_numeric(d["value_0h"], errors="coerce")
+        v24 = pd.to_numeric(d["value_24h"], errors="coerce")
+        d["delta_0_24"] = v24 - v0
+        d["slope_0_24"] = d["delta_0_24"] / 24.0
+    return d
+
+
+def _linear_baseline(df: pd.DataFrame, target_horizon_h: float = 168.0) -> np.ndarray:
+    d = _ensure_features(df)
+    return _linear(d.assign(forecast_origin_h=24.0), target_horizon_h)
+
+
+def _fit_conformal_intervals(y: np.ndarray, pred: np.ndarray, coverage: float = 0.90) -> float:
+    return _conformal(np.asarray(y, dtype=float), np.asarray(pred, dtype=float), coverage=coverage)

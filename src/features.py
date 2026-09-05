@@ -223,6 +223,23 @@ class FeatureEngine:
         censor = out.get("censoring", pd.Series("NONE", index=out.index)).astype("string").str.upper()
         out["quality_is_censored"] = (~censor.isin(["NONE", "NAN", "", "<NA>"])).astype("int8")
         out["quality_censor_direction"] = censor.map({"GT": 1, "GE": 1, "LT": -1, "LE": -1}).fillna(0).astype("int8")
+        # Repeatability/measurement stability features. Duplicate samples at the same
+        # part-parameter-time are retained; these summaries quantify their spread.
+        repeat_keys=[k for k in ["part_id","parameter","time_h"] if k in out.columns]
+        if repeat_keys:
+            vg=_finite_series(out["value"]).groupby([out[k] for k in repeat_keys], dropna=False, sort=False)
+            out["repeat_count"]=vg.transform("count").fillna(0).astype("int64")
+            out["repeat_mean"]=vg.transform("mean")
+            out["repeat_std"]=vg.transform("std").fillna(0.0)
+            out["repeat_range"]=vg.transform(lambda x: x.max()-x.min())
+            out["repeat_cv_percent"]=(100.0*out["repeat_std"].abs()/out["repeat_mean"].abs().replace(0,np.nan)).fillna(0.0)
+        else:
+            out["repeat_count"]=1
+            out["repeat_mean"]=_finite_series(out["value"])
+            out["repeat_std"]=0.0
+            out["repeat_range"]=0.0
+            out["repeat_cv_percent"]=0.0
+
         qflag = out.get("quality_flag", pd.Series("VALID", index=out.index)).astype("string").str.upper()
         out["quality_flag_code"] = qflag.map({"VALID": 0, "LIMITED": 1, "ERROR": 2}).fillna(3).astype("int8")
 
@@ -276,3 +293,27 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+def feature_availability_manifest(df: pd.DataFrame, as_of_h: float = 24.0) -> dict[str, Any]:
+    """Return a deterministic record of history-dependent feature availability."""
+    if "time_h" not in df.columns or "part_id" not in df.columns:
+        return {"as_of_h": float(as_of_h), "status": "UNKNOWN", "readpoint_distribution": {}}
+    times = pd.to_numeric(df["time_h"], errors="coerce")
+    counts = df.loc[times <= float(as_of_h)].groupby("part_id")["time_h"].nunique() if len(df) else pd.Series(dtype=int)
+    n2 = int((counts >= 2).sum()); n3 = int((counts >= 3).sum()); n8 = int((counts >= 8).sum())
+    return {
+        "as_of_h": float(as_of_h),
+        "parts": int(counts.size),
+        "parts_with_2plus_readpoints": n2,
+        "parts_with_3plus_readpoints": n3,
+        "parts_with_8plus_readpoints": n8,
+        "feature_rules": {
+            "baseline_and_population": "1+ observed readpoint",
+            "slope": "2+ observed readpoints",
+            "acceleration_curvature_change_point": "3+ observed readpoints",
+            "advanced_temporal_model": "8+ observed readpoints",
+        },
+    }
