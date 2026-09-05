@@ -1,0 +1,199 @@
+# Model registry and selection policy.
+# Model implementations live in src/anomaly.py / src/forecast.py.
+# This file defines what may be selected and under what data conditions.
+
+schema_version: "1.0"
+
+runtime:
+  random_seed: 20260831
+  deterministic: true
+  n_jobs: -1
+  artifact_format: joblib
+
+common:
+  identifier_columns:
+    - part_id
+    - lot_id
+  context_columns:
+    - component_family
+    - component_type
+    - parameter
+    - test_stage
+    - test_method
+    - temperature_C
+    - voltage_V
+    - stress_mode
+  target_leakage_policy: "never_use_future_measurements_as_features"
+
+anomaly:
+  objective: "high_recall_latent_defect_screening"
+  ensemble:
+    enabled: true
+    components:
+      - absolute_limits
+      - robust_population
+      - isolation_forest
+      - temporal_deviation
+    fusion:
+      method: calibrated_weighted_ensemble
+      weights:
+        absolute_limits: 0.25
+        robust_population: 0.30
+        isolation_forest: 0.20
+        temporal_deviation: 0.25
+      weights_are_initial: true
+      final_weights_must_be_validated: true
+
+  baselines:
+    robust_population:
+      enabled: true
+      methods:
+        - median_mad
+        - iqr
+        - empirical_percentile
+      minimum_lot_size: 20
+      minimum_reference_points: 10
+
+    isolation_forest:
+      enabled: true
+      n_estimators: 400
+      contamination: auto
+      max_samples: auto
+      random_state_from_runtime: true
+      minimum_samples: 100
+
+    robust_covariance:
+      enabled: auto
+      method: MinCovDet
+      minimum_samples: 100
+      max_features_ratio: 0.25
+      only_when_dimension_is_small: true
+
+    local_outlier_factor:
+      enabled: auto
+      minimum_samples: 100
+      n_neighbors: 35
+      novelty_mode: true
+
+  advanced:
+    representation_autoencoder:
+      enabled: auto
+      minimum_rows: 5000
+      minimum_parameters: 3
+      requires_validation_gain_over_baseline: true
+      acceptance_metric: latent_defect_recall_at_fixed_fpr
+
+  calibration:
+    enabled: true
+    method: isotonic_or_platt
+    calibration_split_by_lot: true
+    optimize_for: latent_defect_recall
+    prohibit_test_set_calibration: true
+
+forecast:
+  objective: "future_parametric_drift_prediction"
+  target: value_at_requested_future_horizon
+  target_horizon_policy:
+    default_horizon_h: 168.0
+    may_be_overridden_by_input: true
+    horizon_must_be_future_relative_to_features: true
+
+  baselines:
+    persistence:
+      enabled: true
+    linear_drift:
+      enabled: true
+      robust: true
+    ridge:
+      enabled: true
+      alpha_grid: [0.01, 0.1, 1.0, 10.0, 100.0]
+    quantile_ridge:
+      enabled: true
+      quantiles: [0.05, 0.50, 0.95]
+
+  primary:
+    gradient_boosting:
+      enabled: true
+      model: HistGradientBoostingRegressor
+      learning_rate: 0.05
+      max_iter: 500
+      max_leaf_nodes: 31
+      l2_regularization: 1.0
+      early_stopping: true
+      validation_split_by_lot: true
+
+  advanced:
+    temporal_model:
+      enabled: auto
+      family: TCN_or_transformer
+      minimum_readpoints: 8
+      minimum_training_parts: 5000
+      requires_validation_gain_over_gradient_boosting: true
+      acceptance_metric: mae_and_limit_exceedance_calibration
+
+  uncertainty:
+    enabled: true
+    primary: conformal_prediction
+    method: split_conformal
+    coverage_targets: [0.80, 0.90, 0.95]
+    calibration_split_by_lot: true
+    prohibit_test_set_calibration: true
+
+  risk:
+    estimate_probability_of_limit_exceedance: true
+    use_upper_prediction_bound_for_safety: true
+    do_not_treat_point_prediction_as_certainty: true
+
+ood:
+  enabled: true
+  purpose: "prevent unsupported confident decisions on unfamiliar data"
+  checks:
+    schema_novelty: true
+    parameter_semantic_novelty: true
+    population_shift: true
+    feature_shift: true
+    stress_context_shift: true
+    component_family_shift: true
+  methods:
+    robust_distance: true
+    density_or_isolation_score: true
+  thresholds:
+    learned_from_reference_data: true
+    fixed_value: null
+  actions:
+    severe_ood: REVIEW
+    unknown_semantics: UNKNOWN
+    mild_ood: REVIEW
+
+model_selection:
+  feature_availability:
+    sparse_readpoints_max: 4
+    temporal_model_min_readpoints: 8
+  missingness:
+    allow_missing_features: true
+    max_missing_fraction_for_standard_inference: 0.40
+    above_max_missingness_action: UNKNOWN
+  complexity_rule:
+    prefer_simplest_model_meeting_validation_target: true
+    reject_advanced_model_without_holdout_gain: true
+
+validation:
+  splits:
+    strategy: group_by_lot
+    train_fraction: 0.70
+    validation_fraction: 0.15
+    test_fraction: 0.15
+    no_row_level_random_split: true
+  primary_metrics:
+    anomaly:
+      - false_negative_rate
+      - latent_defect_recall
+      - precision
+      - pr_auc
+    forecast:
+      - mae
+      - rmse
+      - limit_exceedance_brier_score
+      - conformal_coverage
+  safety_metric:
+    - cost_weighted_error

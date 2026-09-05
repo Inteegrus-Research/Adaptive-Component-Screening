@@ -1,0 +1,551 @@
+# Parameter ontology for the universal screening pipeline.
+#
+# IMPORTANT:
+# - Numeric ranges below are machine-validation / plausibility ranges, not ISRO
+#   acceptance limits unless explicitly marked as such.
+# - Engineering limits must come from the incoming dataset/specification or an
+#   approved screening profile, never from these generic ranges alone.
+# - source_class: observed | source_derived | engineering_assumption
+#
+# Canonical semantic IDs are stable API names. Raw aliases are mapped to these IDs.
+
+schema_version: "1.0"
+
+ontology:
+  canonical_fields:
+    part_id: identifier
+    lot_id: identifier
+    wafer_id: identifier
+    test_run_id: identifier
+    component_family: categorical
+    component_type: categorical
+    parameter: semantic_parameter
+    value: numeric
+    unit: unit
+    time_h: time
+    test_stage: categorical
+    test_method: categorical
+    temperature_C: context_numeric
+    voltage_V: context_numeric
+    current_A: context_numeric
+    stress_mode: categorical
+    measurement_status: categorical
+    censoring: categorical
+    quality_flag: categorical
+
+  directionality:
+    values:
+      - higher_is_worse
+      - lower_is_worse
+      - context_dependent
+      - nominal_target
+      - non_monotonic
+
+  source_classes:
+    values:
+      - observed
+      - source_derived
+      - engineering_assumption
+
+  measurement_status_values:
+    - valid
+    - missing
+    - failed_test
+    - below_detection
+    - above_range
+    - censored
+
+components:
+  MONOLITHIC_IC:
+    description: "Monolithic IC / MMIC / analog or digital microcircuit screening family"
+    component_types:
+      - MMIC
+      - ANALOG_IC
+      - DIGITAL_IC
+      - REGULATOR
+      - ADC
+      - DAC
+    common_test_methods:
+      - ROOM_TEMPERATURE_ELECTRICAL
+      - HIGH_TEMPERATURE_ELECTRICAL
+      - LOW_TEMPERATURE_ELECTRICAL
+      - POWER_BURN_IN
+      - LIFE_TEST
+    stress_modes:
+      - TEMPERATURE
+      - ELECTRICAL_BIAS
+      - POWER_BURN_IN
+
+  DISCRETE_SEMICONDUCTOR:
+    description: "Discrete semiconductor / power semiconductor family"
+    component_types:
+      - POWER_MOSFET
+      - IGBT
+      - DIODE
+      - TRANSISTOR
+    common_test_methods:
+      - ROOM_TEMPERATURE_ELECTRICAL
+      - HIGH_TEMPERATURE_ELECTRICAL
+      - LOW_TEMPERATURE_ELECTRICAL
+      - HTRB
+      - THERMAL_OVERSTRESS
+      - POWER_BURN_IN
+      - LIFE_TEST
+    stress_modes:
+      - TEMPERATURE
+      - ELECTRICAL_BIAS
+      - HTRB
+      - THERMAL_OVERSTRESS
+      - POWER_BURN_IN
+
+  CAPACITOR:
+    description: "High-reliability capacitor screening family"
+    component_types:
+      - SOLID_TANTALUM
+      - CERAMIC_MLCC
+      - ELECTROLYTIC
+    common_test_methods:
+      - ROOM_TEMPERATURE_ELECTRICAL
+      - HIGH_TEMPERATURE_ELECTRICAL
+      - VOLTAGE_STRESS
+      - LIFE_TEST
+    stress_modes:
+      - TEMPERATURE
+      - VOLTAGE_BIAS
+      - VOLTAGE_STRESS
+
+parameters:
+  quiescent_current:
+    aliases:
+      - IDDQ
+      - I_DDQ
+      - Iddq
+      - Icc_q
+      - ICCQ
+      - IQ
+      - QUIESCENT_CURRENT
+      - QUIESCENT_CURRENT_UA
+    physical_quantity: current
+    semantic_class: quiescent_current
+    unit_family: current
+    preferred_unit: uA
+    accepted_units: [A, mA, uA, nA]
+    directionality: higher_is_worse
+    applicable_families: [MONOLITHIC_IC]
+    applicable_types: [MMIC, ANALOG_IC, DIGITAL_IC, REGULATOR]
+    valid_range:
+      min: 0.0
+      max: 1000000.0
+      unit: uA
+    nominal_distribution:
+      family: lognormal_or_empirical
+      note: "Distribution must be calibrated from source data or incoming lot data."
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: higher_is_worse
+    source_class: source_derived
+
+  input_leakage_current:
+    aliases:
+      - IIN_LEAK
+      - I_IN_LEAK
+      - ILEAK
+      - INPUT_LEAKAGE
+      - INPUT_LEAKAGE_CURRENT
+      - I_IN
+    physical_quantity: current
+    semantic_class: input_leakage_current
+    unit_family: current
+    preferred_unit: nA
+    accepted_units: [A, mA, uA, nA, pA]
+    directionality: higher_is_worse
+    applicable_families: [MONOLITHIC_IC]
+    applicable_types: [MMIC, ANALOG_IC, DIGITAL_IC, ADC, DAC]
+    valid_range:
+      min: 0.0
+      max: 1000000000.0
+      unit: nA
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: higher_is_worse
+    source_class: source_derived
+
+  supply_operating_current:
+    aliases:
+      - IDD
+      - I_DD
+      - Icc
+      - ICC
+      - SUPPLY_CURRENT
+      - OPERATING_CURRENT
+    physical_quantity: current
+    semantic_class: operating_supply_current
+    unit_family: current
+    preferred_unit: mA
+    accepted_units: [A, mA, uA]
+    directionality: context_dependent
+    applicable_families: [MONOLITHIC_IC]
+    applicable_types: [MMIC, ANALOG_IC, DIGITAL_IC, REGULATOR, ADC, DAC]
+    valid_range:
+      min: 0.0
+      max: 1000.0
+      unit: mA
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: context_dependent
+    source_class: source_derived
+
+  propagation_delay:
+    aliases:
+      - TPD
+      - T_PD
+      - PROP_DELAY
+      - PROPAGATION_DELAY
+      - PROPAGATION_DELAY_NS
+      - TURN_ON_DELAY
+      - TURN_OFF_DELAY
+    physical_quantity: time
+    semantic_class: propagation_delay
+    unit_family: time
+    preferred_unit: ns
+    accepted_units: [s, ms, us, ns, ps]
+    directionality: higher_is_worse
+    applicable_families: [MONOLITHIC_IC, DISCRETE_SEMICONDUCTOR]
+    applicable_types: [DIGITAL_IC, MMIC, POWER_MOSFET, IGBT]
+    valid_range:
+      min: 0.0
+      max: 1000000000.0
+      unit: ns
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: higher_is_worse
+    source_class: source_derived
+
+  threshold_voltage:
+    aliases:
+      - VTH
+      - V_TH
+      - VGS_TH
+      - VGSth
+      - THRESHOLD_VOLTAGE
+    physical_quantity: voltage
+    semantic_class: threshold_voltage
+    unit_family: voltage
+    preferred_unit: V
+    accepted_units: [V, mV]
+    directionality: context_dependent
+    applicable_families: [DISCRETE_SEMICONDUCTOR]
+    applicable_types: [POWER_MOSFET, IGBT, TRANSISTOR]
+    valid_range:
+      min: -100.0
+      max: 100.0
+      unit: V
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: context_dependent
+    source_class: source_derived
+
+  drain_source_leakage:
+    aliases:
+      - IDSS
+      - I_DSS
+      - IDSS_UA
+      - DRAIN_LEAKAGE
+      - DRAIN_SOURCE_LEAKAGE
+    physical_quantity: current
+    semantic_class: drain_source_leakage
+    unit_family: current
+    preferred_unit: uA
+    accepted_units: [A, mA, uA, nA]
+    directionality: higher_is_worse
+    applicable_families: [DISCRETE_SEMICONDUCTOR]
+    applicable_types: [POWER_MOSFET]
+    valid_range:
+      min: 0.0
+      max: 10000000.0
+      unit: uA
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: higher_is_worse
+    source_class: observed
+
+  gate_source_leakage:
+    aliases:
+      - IGSS
+      - I_GSS
+      - IGATE
+      - GATE_LEAKAGE
+      - GATE_SOURCE_LEAKAGE
+    physical_quantity: current
+    semantic_class: gate_source_leakage
+    unit_family: current
+    preferred_unit: uA
+    accepted_units: [A, mA, uA, nA]
+    directionality: higher_is_worse
+    applicable_families: [DISCRETE_SEMICONDUCTOR]
+    applicable_types: [POWER_MOSFET]
+    valid_range:
+      min: 0.0
+      max: 1000000.0
+      unit: uA
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: higher_is_worse
+    source_class: observed
+
+  drain_source_on_resistance:
+    aliases:
+      - RDS_ON
+      - RDS(on)
+      - R_DS_ON
+      - RON
+      - ON_RESISTANCE
+    physical_quantity: resistance
+    semantic_class: conduction_resistance
+    unit_family: resistance
+    preferred_unit: mOhm
+    accepted_units: [Ohm, mOhm, uOhm]
+    directionality: higher_is_worse
+    applicable_families: [DISCRETE_SEMICONDUCTOR]
+    applicable_types: [POWER_MOSFET]
+    valid_range:
+      min: 0.0
+      max: 1000000000.0
+      unit: mOhm
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: higher_is_worse
+    source_class: source_derived
+
+  collector_emitter_on_voltage:
+    aliases:
+      - VCE_ON
+      - VCE(on)
+      - VCE_SAT
+      - VCE_SATURATION
+      - COLLECTOR_EMITTER_ON_VOLTAGE
+    physical_quantity: voltage
+    semantic_class: conduction_voltage_drop
+    unit_family: voltage
+    preferred_unit: V
+    accepted_units: [V, mV]
+    directionality: higher_is_worse
+    applicable_families: [DISCRETE_SEMICONDUCTOR]
+    applicable_types: [IGBT]
+    valid_range:
+      min: 0.0
+      max: 100.0
+      unit: V
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: higher_is_worse
+    source_class: observed
+
+  collector_current:
+    aliases:
+      - IC
+      - I_C
+      - COLLECTOR_CURRENT
+      - COLLECTOR_CURRENT_A
+    physical_quantity: current
+    semantic_class: collector_current
+    unit_family: current
+    preferred_unit: A
+    accepted_units: [A, mA, uA]
+    directionality: context_dependent
+    applicable_families: [DISCRETE_SEMICONDUCTOR]
+    applicable_types: [IGBT]
+    valid_range:
+      min: -1000000.0
+      max: 1000000.0
+      unit: A
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: context_dependent
+    source_class: observed
+
+  breakdown_voltage:
+    aliases:
+      - VBR
+      - V_BR
+      - BV
+      - BREAKDOWN_VOLTAGE
+      - BVDS
+      - BVCES
+    physical_quantity: voltage
+    semantic_class: breakdown_voltage
+    unit_family: voltage
+    preferred_unit: V
+    accepted_units: [V, kV]
+    directionality: context_dependent
+    applicable_families: [DISCRETE_SEMICONDUCTOR]
+    applicable_types: [POWER_MOSFET, IGBT, DIODE, TRANSISTOR]
+    valid_range:
+      min: 0.0
+      max: 100000.0
+      unit: V
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: context_dependent
+    source_class: source_derived
+
+  capacitance:
+    aliases:
+      - C
+      - CAP
+      - CAPACITANCE
+      - CAP_UF
+      - NOMINAL_CAPACITANCE
+    physical_quantity: capacitance
+    semantic_class: capacitance
+    unit_family: capacitance
+    preferred_unit: uF
+    accepted_units: [F, mF, uF, nF, pF]
+    directionality: nominal_target
+    applicable_families: [CAPACITOR]
+    applicable_types: [SOLID_TANTALUM, CERAMIC_MLCC, ELECTROLYTIC]
+    valid_range:
+      min: 0.0
+      max: 1000000000.0
+      unit: uF
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: nominal_target
+    source_class: observed
+
+  leakage_current:
+    aliases:
+      - ICL
+      - I_CL
+      - CAP_LEAKAGE
+      - CAPACITOR_LEAKAGE
+      - LEAKAGE_CURRENT
+      - LC
+    physical_quantity: current
+    semantic_class: capacitor_leakage_current
+    unit_family: current
+    preferred_unit: uA
+    accepted_units: [A, mA, uA, nA]
+    directionality: higher_is_worse
+    applicable_families: [CAPACITOR]
+    applicable_types: [SOLID_TANTALUM, CERAMIC_MLCC, ELECTROLYTIC]
+    valid_range:
+      min: 0.0
+      max: 100000000.0
+      unit: uA
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: higher_is_worse
+    source_class: source_derived
+
+  esr:
+    aliases:
+      - ESR
+      - EQUIVALENT_SERIES_RESISTANCE
+      - ESR_MOHM
+    physical_quantity: resistance
+    semantic_class: equivalent_series_resistance
+    unit_family: resistance
+    preferred_unit: Ohm
+    accepted_units: [Ohm, mOhm, uOhm]
+    directionality: higher_is_worse
+    applicable_families: [CAPACITOR]
+    applicable_types: [SOLID_TANTALUM, CERAMIC_MLCC, ELECTROLYTIC]
+    valid_range:
+      min: 0.0
+      max: 1000000.0
+      unit: Ohm
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: higher_is_worse
+    source_class: observed
+
+  impedance:
+    aliases:
+      - Z
+      - IMPEDANCE
+      - EIS_MAGNITUDE
+      - Z_MAG
+    physical_quantity: impedance
+    semantic_class: impedance
+    unit_family: resistance
+    preferred_unit: Ohm
+    accepted_units: [Ohm, mOhm]
+    directionality: context_dependent
+    applicable_families: [CAPACITOR]
+    applicable_types: [SOLID_TANTALUM, CERAMIC_MLCC, ELECTROLYTIC]
+    valid_range:
+      min: 0.0
+      max: 1000000000.0
+      unit: Ohm
+    screening_limit:
+      source: incoming_specification
+      generic_value: null
+      direction: context_dependent
+    source_class: source_derived
+
+context_parameters:
+  burnin_temperature:
+    aliases: [T_BURNIN, BURNIN_TEMP, BURN_IN_TEMPERATURE, OVEN_TEMP_C]
+    physical_quantity: temperature
+    semantic_class: burnin_temperature
+    unit_family: temperature
+    preferred_unit: C
+    accepted_units: [C, K]
+    valid_range: {min: -100.0, max: 500.0, unit: C}
+    source_class: observed
+
+  applied_voltage:
+    aliases: [V_APPLIED, STRESS_VOLTAGE, APPLIED_VOLTAGE]
+    physical_quantity: voltage
+    semantic_class: applied_stress_voltage
+    unit_family: voltage
+    preferred_unit: V
+    accepted_units: [V, kV, mV]
+    valid_range: {min: -100000.0, max: 100000.0, unit: V}
+    source_class: observed
+
+  applied_current:
+    aliases: [I_APPLIED, STRESS_CURRENT, APPLIED_CURRENT]
+    physical_quantity: current
+    semantic_class: applied_stress_current
+    unit_family: current
+    preferred_unit: A
+    accepted_units: [A, mA, uA]
+    valid_range: {min: -100000.0, max: 100000.0, unit: A}
+    source_class: observed
+
+  time_hours:
+    aliases: [TIME_H, TIME, ELAPSED_H, HOURS, BURNIN_H]
+    physical_quantity: time
+    semantic_class: elapsed_test_time
+    unit_family: time
+    preferred_unit: h
+    accepted_units: [s, min, h, day]
+    valid_range: {min: 0.0, max: 10000000.0, unit: h}
+    source_class: observed
+
+aliases_policy:
+  matching:
+    case_insensitive: true
+    strip_whitespace: true
+    normalize_punctuation: true
+    allow_unit_suffix: true
+    allow_numeric_suffix: false
+  ambiguity:
+    action: require_manual_resolution
+    never_guess_between_multiple_semantic_matches: true
