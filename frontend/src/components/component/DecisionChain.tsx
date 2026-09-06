@@ -1,0 +1,3 @@
+import type { ReactNode } from 'react'
+import { Decision } from '../../types/api'
+export function DecisionChain({ activeDecision }: { activeDecision?: Decision }) { const items = ['Measurement', 'Evidence', 'Inference', 'Forecast', 'Policy', 'Disposition']; return <div className="decisionChain">{items.map((x, i) => <span key={x} className={`chainItem ${i === items.length - 1 ? `final ${String(activeDecision || '').toLowerCase()}` : ''}`}>{x}</span>).reduce<ReactNode[]>((out, item, i) => { if (i === 0) out.push(item); else out.push(<span className="chainArrow" key={`a-${i}`}>→</span>, item); return out }, [])}</div> }

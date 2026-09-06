@@ -1,0 +1,2 @@
+export function num(v: unknown, digits = 2): string { if (v == null || v === '' || Number.isNaN(Number(v))) return '—'; return Number(v).toFixed(digits).replace(/\.0+$|(?<=\.[0-9]*?)0+$/g, '').replace(/\.$/, '') }
+export function parseList(v: unknown): string[] { if (Array.isArray(v)) return v.map(String); if (typeof v !== 'string' || !v.trim()) return []; try { const x = JSON.parse(v); return Array.isArray(x) ? x.map(String) : [] } catch { return [] } }
