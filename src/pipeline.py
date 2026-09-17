@@ -1,346 +1,483 @@
-"""Operational screening pipeline orchestration.
-
-Composes data ingestion, universal representation, multi-channel anomaly screening,
-horizon-isolated drift forecasting, OOD bounds assessment, safety policy gating,
-and hierarchical engineering explanation into a single unified execution pipeline.
-"""
 from __future__ import annotations
 
-import argparse
-import json
-import re
-import tempfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
-from src.anomaly import fit_anomaly, load_anomaly_model, score_anomaly
-from src.explain import render_report
-from src.features import FeatureEngine, validate_features, feature_availability_manifest
-from src.forecast import fit_forecast, load_forecast_model, predict_forecast
-from src.ingest import canonicalize_csv, profile_csv, validate_canonical
-from src.safety import assess_screening, fit_ood_profile, load_ood_profile
-from src.utils import PROJECT_ROOT, load_yaml, seed_everything
+from src.anomaly import (
+    AnomalyConfig,
+    detect_anomalies,
+)
+from src.explain import (
+    ExplanationTrace,
+    explain_dataframe,
+    traces_to_dict,
+)
+from src.features import (
+    FeatureConfig,
+    add_features,
+)
+from src.forecast import (
+    ForecastConfig,
+    forecast_components,
+)
+from src.ingest import (
+    IngestionAudit,
+    ingest_dataframe,
+    load_parameter_config,
+)
+from src.safety import (
+    apply_safety_policy,
+    load_policy,
+)
 
 
 @dataclass(frozen=True)
-class PipelineArtifacts:
-    anomaly_model: Path
-    forecast_model: Path
-    ood_profile: Path
+class CapabilityManifest:
+    ingestion_mode: str
+
+    module_a_mode: str
+    module_b_mode: str
+
+    ood_status: str
+    risk_mode: str
+
+    rows_ingested: int
+    components_processed: int
+    parameters_processed: int
+
+    unknown_parameters: int
+    irregular_timestamp_groups: int
 
 
 @dataclass
-class ScreeningRun:
-    screening: pd.DataFrame
-    explanations: pd.DataFrame
-    canonical: pd.DataFrame
-    features: pd.DataFrame
-    anomaly: pd.DataFrame
-    forecast: pd.DataFrame
-    ood: dict[str, Any]
-    manifest: dict[str, Any]
+class ScreeningResult:
+    canonical_telemetry: pd.DataFrame
+    feature_table: pd.DataFrame
+    triage: pd.DataFrame
+    explanations: list[ExplanationTrace]
+    capability_manifest: CapabilityManifest
+    ingestion_audit: IngestionAudit
 
-
-class PipelineError(RuntimeError):
-    pass
-
-
-def _default_paths() -> PipelineArtifacts:
-    return PipelineArtifacts(
-        anomaly_model=PROJECT_ROOT / "models" / "anomaly" / "model.joblib",
-        forecast_model=PROJECT_ROOT / "models" / "forecast" / "model.joblib",
-        ood_profile=PROJECT_ROOT / "models" / "calibration" / "ood_profile.joblib",
-    )
-
-
-def _read_csv(path: str | Path) -> pd.DataFrame:
-    return pd.read_csv(path, low_memory=False)
-
-
-def _write(df: pd.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
-
-
-def _model_input_from_canonical(canonical: pd.DataFrame, *, as_of_h: float = 24.0) -> pd.DataFrame:
-    d = canonical.copy()
-    if "time_h" not in d.columns:
-        raise PipelineError("Canonical data has no time_h field.")
-    if "part_id" not in d.columns or "parameter" not in d.columns:
-        raise PipelineError("Canonical input requires part_id and parameter.")
-
-    d["_value"] = pd.to_numeric(d["value"], errors="coerce")
-    d["_time"] = pd.to_numeric(d["time_h"], errors="coerce")
-
-    context_keys = [
-        c for c in [
-            "part_id", "lot_id", "wafer_id", "test_run_id", "component_family",
-            "component_type", "parameter", "semantic_type", "physical_quantity",
-            "unit", "profile_id", "test_stage", "test_method", "stress_mode",
-        ] if c in d.columns and d[c].notna().any()
-    ]
-    grouped = (
-        d.groupby(context_keys + ["_time"], dropna=False, sort=False, observed=True)["_value"]
-        .first().unstack("_time").reset_index()
-    )
-    wide = grouped.copy()
-    wide.columns = [str(c) for c in wide.columns]
-
-    rename = {}
-    for c in list(wide.columns):
-        try:
-            t = float(c)
-        except (TypeError, ValueError):
-            continue
-        label = f"value_{int(round(t))}h" if abs(t - round(t)) < 1e-9 else f"value_{t:g}h"
-        rename[c] = label
-    wide = wide.rename(columns=rename)
-
-    time_cols = []
-    for c in wide.columns:
-        m = re.fullmatch(r"value_(\d+(?:\.\d+)?)h", str(c))
-        if m:
-            t = float(m.group(1))
-            if t <= float(as_of_h):
-                time_cols.append((t, c))
-    time_cols.sort()
-    if not time_cols:
-        raise PipelineError(f"No observations at or before as_of_h={as_of_h}.")
-
-    origin_candidates = pd.DataFrame(
-        {t: pd.to_numeric(wide[c], errors="coerce") for t, c in time_cols},
-        index=wide.index,
-    )
-    origin_candidates = origin_candidates.where(origin_candidates.notna(), np.nan)
-    wide["forecast_origin_h"] = origin_candidates.apply(
-        lambda r: float(r.dropna().index[-1]) if r.notna().any() else np.nan, axis=1
-    )
-    wide["available_readpoints_h"] = origin_candidates.apply(
-        lambda r: ",".join(f"{float(t):g}" for t in r.dropna().index), axis=1
-    )
-
-    if "value_0h" not in wide.columns:
-        wide["value_0h"] = np.nan
-        
-    # Compatibility alias: when a nearest pre-24h measurement exists, expose it as
-    # value_24h for legacy consumers but mark it as a proxy. Forecast code ignores
-    # proxy readpoints, so this never becomes a fabricated 24 h observation.
-    if "value_24h" not in wide.columns:
-        pre = [(t, c) for t, c in time_cols if 0 < t <= min(24.0, float(as_of_h))]
-        if pre:
-            latest_t, src = max(pre, key=lambda x: x[0])
-            wide["value_24h"] = wide[src]
-            wide["value_24h_is_proxy"] = 1 if abs(latest_t - 24.0) > 1e-9 else 0
-        else:
-            wide["value_24h"] = np.nan
-            wide["value_24h_is_proxy"] = 1
-    else:
-        wide["value_24h_is_proxy"] = 0
-    wide["adapted_forecast_origin"] = wide.get("value_24h_is_proxy", 0).astype(int)
-    # Compatibility/evaluation placeholder only. It is NaN by construction and
-    # is never included in forecast supervised features.
-    if "target_168h" not in wide.columns:
-        wide["target_168h"] = np.nan
-    return wide
-
-
-def _overlay_source_metadata(source: pd.DataFrame, wide: pd.DataFrame, canonical: pd.DataFrame | None = None) -> pd.DataFrame:
-    d = source.copy()
-    candidate = [
-        "absolute_limit_lower", "absolute_limit_upper",
-        "engineering_limit_lower", "engineering_limit_upper",
-        "upper_limit", "lower_limit", "spec_upper", "spec_lower",
-        "observable_safety_slope", "profile_id", "split",
-        "latent_defect_label", "defect_state", "high_but_safe", "measurement_only_anomaly",
-        "precursor_strength", "precursor_effect", "failure_mode", "primary_failure_mode",
-    ]
-    present = [c for c in candidate if c in d.columns and d[c].notna().any()]
-    if not present: return wide
-    keys = [c for c in ["part_id", "lot_id", "parameter", "component_family", "component_type"] if c in d.columns and c in wide.columns]
-    if not keys: return wide
-    meta_keys = [k for k in ["part_id", "lot_id", "parameter", "component_family", "component_type"] if k in d.columns]
-    meta = d[meta_keys + present].copy()
-    
-    if canonical is not None and "parameter" in meta.columns and "raw_parameter" in canonical.columns:
-        mapping = canonical[["part_id", "lot_id", "raw_parameter", "parameter"]].drop_duplicates()
-        mapping = mapping.rename(columns={"raw_parameter": "raw_parameter_key", "parameter": "canonical_parameter"})
-        meta = meta.merge(
-            mapping,
-            left_on=[c for c in ["part_id", "lot_id", "parameter"] if c in meta.columns],
-            right_on=["part_id", "lot_id", "raw_parameter_key"],
-            how="left",
-        )
-        meta["parameter"] = meta["canonical_parameter"].fillna(meta["parameter"])
-        meta = meta.drop(columns=[c for c in ["raw_parameter_key", "canonical_parameter"] if c in meta.columns])
-        
-    if "part_type" in d.columns and "component_type" not in d.columns:
-        meta["component_type"] = d["part_type"].to_numpy()
-        
-    for c in present:
-        if c not in meta.columns: continue
-        if c not in {"split", "defect_state", "high_but_safe", "profile_id", "failure_mode", "primary_failure_mode"}:
-            converted = pd.to_numeric(meta[c], errors="coerce")
-            if converted.notna().any(): meta[c] = converted
-    meta = meta.drop_duplicates(keys, keep="first")
-    return wide.merge(meta, on=keys, how="left", suffixes=("", "_source"))
-
-
-def _ensure_artifacts(
-    artifacts: PipelineArtifacts,
-    reference_anomaly: Path,
-    reference_forecast: Path,
-    reference_ood: Path,
-    as_of_h: float,
-    target_horizon: float = 168.0,
-) -> None:
-    artifacts.anomaly_model.parent.mkdir(parents=True, exist_ok=True)
-    artifacts.forecast_model.parent.mkdir(parents=True, exist_ok=True)
-    artifacts.ood_profile.parent.mkdir(parents=True, exist_ok=True)
-
-    if not artifacts.anomaly_model.exists(): fit_anomaly(reference_anomaly, artifacts.anomaly_model, as_of_h=as_of_h)
-    if not artifacts.forecast_model.exists(): fit_forecast(reference_forecast, artifacts.forecast_model, target_horizon_h=float(target_horizon))
-    if not artifacts.ood_profile.exists(): fit_ood_profile(reference_ood, artifacts.ood_profile)
-
-
-def screen_file(
-    input_path: str | Path,
-    output_dir: str | Path,
-    *,
-    artifacts: PipelineArtifacts | None = None,
-    reference_anomaly: str | Path | None = None,
-    reference_forecast: str | Path | None = None,
-    reference_ood: str | Path | None = None,
-    as_of_h: float = 24.0,
-    target_horizon: float = 168.0,
-    auto_train_missing: bool = False,
-    compute_features: bool = True,
-    render_explanations: bool = True,
-) -> ScreeningRun:
-    config = load_yaml(PROJECT_ROOT / "configs" / "models.yaml")
-    seed_everything(int(config.get("runtime", {}).get("random_seed", 20260831)))
-    artifacts = artifacts or _default_paths()
-    outdir = Path(output_dir); outdir.mkdir(parents=True, exist_ok=True)
-
-    raw = _read_csv(input_path)
-    source_profile = profile_csv(input_path)
-    source_file = str(input_path)
-
-    with tempfile.TemporaryDirectory(prefix="screening_", dir=outdir) as td:
-        td_path = Path(td)
-        canonical_path = td_path / "canonical.csv"
-        canonicalize_csv(input_path, canonical_path)
-        canonical = pd.read_csv(canonical_path)
-        valid, errors = validate_canonical(canonical)
-        if not valid: raise PipelineError("Canonical validation failed: " + "; ".join(errors[:10]))
-
-        wide = _model_input_from_canonical(canonical, as_of_h=as_of_h)
-        wide = _overlay_source_metadata(raw, wide, canonical)
-
-        if compute_features:
-            engine = FeatureEngine.from_project_config()
-            features = engine.build(canonical)
-            feature_ok, feature_errors = validate_features(features)
-            if not feature_ok: raise PipelineError("Feature validation failed: " + "; ".join(feature_errors[:10]))
-        else: features = pd.DataFrame()
-            
-        canonical_out = outdir / "canonical.csv"; features_out = outdir / "features.csv"
-        _write(canonical, canonical_out); _write(features, features_out)
-
-        default_ref_a = Path(reference_anomaly or PROJECT_ROOT / "data" / "processed" / "module_A_dataset.csv")
-        default_ref_b = Path(reference_forecast or PROJECT_ROOT / "data" / "processed" / "module_B_drift_full.csv")
-        default_ref_o = Path(reference_ood or default_ref_a)
-        if auto_train_missing: _ensure_artifacts(artifacts, default_ref_a, default_ref_b, default_ref_o, as_of_h, target_horizon)
-            
-        missing_artifacts = [str(p) for p in [artifacts.anomaly_model, artifacts.forecast_model, artifacts.ood_profile] if not Path(p).exists()]
-        if missing_artifacts: raise PipelineError("Required model artifacts are missing: " + ", ".join(missing_artifacts) + ". Train compatible artifacts or pass auto_train_missing=True.")
-
-        anomaly_model = load_anomaly_model(artifacts.anomaly_model)
-        anomaly = score_anomaly(anomaly_model, wide, as_of_h=as_of_h, calibrate=True)
-        _write(anomaly, outdir / "anomaly.csv")
-
-        forecast_model = load_forecast_model(artifacts.forecast_model)
-        forecast_input = wide.copy()
-        for col in getattr(forecast_model, "feature_columns", []):
-            if col not in forecast_input.columns:
-                if col in getattr(forecast_model, "numeric_columns", []): forecast_input[col] = np.nan
-                else: forecast_input[col] = "<UNKNOWN>"
-        forecast = predict_forecast(forecast_model, forecast_input, target_horizon=float(target_horizon), forecast_origin_h=None)
-        _write(forecast, outdir / "forecast.csv")
-
-        ood_profile = load_ood_profile(artifacts.ood_profile)
-        from src.safety import assess_data_ood
-        ood_report = assess_data_ood(ood_profile, wide)
-
-        screening = assess_screening(anomaly, forecast, wide, ood_profile)
-        _write(screening, outdir / "screening.csv")
-
-        explanations = render_report(screening, outdir / "explanations.csv", features=features if not features.empty else None) if render_explanations else pd.DataFrame()
-        if not render_explanations: _write(explanations, outdir / "explanations.csv")
-
-        manifest = {
-            "source": source_file, "source_profile": source_profile, "as_of_h": float(as_of_h), "target_horizon_h": float(target_horizon),
-            "forecast_origin_policy": "last observed readpoint <= as_of_h",
-            "feature_availability_policy": "history-dependent features remain unavailable until enough observed readpoints exist; missing values are never backfilled with future data",
-            "feature_availability": feature_availability_manifest(canonical, as_of_h=as_of_h),
-            "rows": {"raw": int(len(raw)), "canonical": int(len(canonical)), "features": int(len(features)), "anomaly": int(len(anomaly)), "forecast": int(len(forecast)), "screening": int(len(screening))},
-            "artifacts": {k: str(v) for k, v in artifacts.__dict__.items()},
-            "decisions": screening["decision"].value_counts(dropna=False).to_dict() if "decision" in screening.columns else {},
-            "ood": {k: v for k, v in ood_report.items() if k != "parts"},
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "canonicalized_telemetry":
+                self.canonical_telemetry.to_dict(
+                    orient="records"
+                ),
+            "feature_table":
+                self.feature_table.to_dict(
+                    orient="records"
+                ),
+            "triage":
+                self.triage.to_dict(
+                    orient="records"
+                ),
+            "explanations":
+                traces_to_dict(
+                    self.explanations
+                ),
+            "capability_manifest":
+                asdict(
+                    self.capability_manifest
+                ),
+            "ingestion_audit":
+                self.ingestion_audit.to_dict(),
         }
-        (outdir / "run_manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
-
-        return ScreeningRun(screening=screening, explanations=explanations, canonical=canonical, features=features, anomaly=anomaly, forecast=forecast, ood=ood_report, manifest=manifest)
 
 
-def screen_dataframe(df: pd.DataFrame, output_dir: str | Path, **kwargs: Any) -> ScreeningRun:
-    outdir = Path(output_dir); outdir.mkdir(parents=True, exist_ok=True); input_path = outdir / "input.csv"; df.to_csv(input_path, index=False)
-    return screen_file(input_path, outdir, **kwargs)
+class ACSPipeline:
+    """Pure ACS orchestration.
+
+    The pipeline deliberately contains no scientific decision logic.
+    It only wires the six architectural questions together.
+    """
+
+    def __init__(
+        self,
+        parameters_path: str | Path = (
+            "configs/parameters.yaml"
+        ),
+        policy_path: str | Path = (
+            "configs/policy.yaml"
+        ),
+    ) -> None:
+        self.parameters_path = Path(
+            parameters_path
+        )
+
+        self.policy_path = Path(
+            policy_path
+        )
+
+        self.parameter_config = (
+            load_parameter_config(
+                self.parameters_path
+            )
+        )
+
+        self.policy = load_policy(
+            self.policy_path
+        )
+
+    def run(
+        self,
+        data: pd.DataFrame,
+        target_horizon_h: float | None = None,
+    ) -> ScreeningResult:
+        canonical, audit = ingest_dataframe(
+            data,
+            parameters_path=self.parameters_path,
+        )
+
+        features = add_features(
+            canonical,
+            self.parameter_config,
+            self._feature_config(),
+        )
+
+        anomaly = detect_anomalies(
+            features,
+            self._anomaly_config(),
+        )
+
+        forecast = forecast_components(
+            anomaly,
+            canonical,
+            self.parameter_config,
+            self._forecast_config(),
+            target_horizon_h=target_horizon_h,
+        )
+
+        if forecast.empty:
+            triage = anomaly.copy()
+        else:
+            triage = anomaly.merge(
+                forecast,
+                on=[
+                    "component_id",
+                    "parameter",
+                ],
+                how="left",
+                suffixes=(
+                    "",
+                    "_forecast",
+                ),
+            )
+
+        triage = (
+            self._latest_readpoint(
+                triage
+            )
+        )
+
+        triage = apply_safety_policy(
+            triage,
+            self.policy,
+        )
+
+        explanations = explain_dataframe(
+            triage
+        )
+
+        manifest = (
+            self._build_manifest(
+                triage,
+                audit,
+            )
+        )
+
+        return ScreeningResult(
+            canonical_telemetry=canonical,
+            feature_table=features,
+            triage=triage,
+            explanations=explanations,
+            capability_manifest=manifest,
+            ingestion_audit=audit,
+        )
+
+    def run_csv(
+        self,
+        path: str | Path,
+        target_horizon_h: float | None = None,
+    ) -> ScreeningResult:
+        frame = pd.read_csv(path)
+
+        return self.run(
+            frame,
+            target_horizon_h=target_horizon_h,
+        )
+
+    @staticmethod
+    def _latest_readpoint(
+        frame: pd.DataFrame,
+    ) -> pd.DataFrame:
+        if frame.empty:
+            return frame.copy()
+
+        result = frame.copy()
+
+        if "time_h" in result.columns:
+            result = result.sort_values(
+                [
+                    "component_id",
+                    "parameter",
+                    "time_h",
+                ],
+                kind="stable",
+            )
+
+        result = (
+            result
+            .groupby(
+                [
+                    "component_id",
+                    "parameter",
+                ],
+                sort=False,
+                as_index=False,
+            )
+            .tail(1)
+        )
+
+        return result.reset_index(
+            drop=True
+        )
+
+    def _feature_config(
+        self,
+    ) -> FeatureConfig:
+        config = self.policy.get(
+            "features",
+            {},
+        )
+
+        return FeatureConfig(
+            min_reference_group_size=int(
+                config.get(
+                    "min_reference_group_size",
+                    8,
+                )
+            ),
+            mad_epsilon=float(
+                config.get(
+                    "mad_epsilon",
+                    1e-9,
+                )
+            ),
+            ewma_alpha=float(
+                config.get(
+                    "ewma_alpha",
+                    0.25,
+                )
+            ),
+            cusum_drift=float(
+                config.get(
+                    "cusum_drift",
+                    0.50,
+                )
+            ),
+            cusum_threshold=float(
+                config.get(
+                    "cusum_threshold",
+                    2.50,
+                )
+            ),
+        )
+
+    def _anomaly_config(
+        self,
+    ) -> AnomalyConfig:
+        return AnomalyConfig(
+            min_iforest_rows=12,
+            random_state=42,
+            robust_weight=0.35,
+            isolation_weight=0.25,
+            temporal_weight=0.20,
+            multivariate_weight=0.20,
+        )
+
+    def _forecast_config(
+        self,
+    ) -> ForecastConfig:
+        config = self.policy.get(
+            "forecast",
+            {},
+        )
+
+        return ForecastConfig(
+            horizon_h=float(
+                config.get(
+                    "horizon_h",
+                    168.0,
+                )
+            ),
+            min_component_points=int(
+                config.get(
+                    "min_component_points",
+                    2,
+                )
+            ),
+            min_training_components=int(
+                config.get(
+                    "min_training_components",
+                    4,
+                )
+            ),
+            min_training_rows=int(
+                config.get(
+                    "min_training_rows",
+                    24,
+                )
+            ),
+            conformal_alpha=float(
+                config.get(
+                    "conformal_alpha",
+                    0.05,
+                )
+            ),
+            min_calibration_residuals=int(
+                config.get(
+                    "min_calibration_residuals",
+                    8,
+                )
+            ),
+            cold_start_min_points_for_trend=int(
+                config.get(
+                    "cold_start_min_points_for_trend",
+                    3,
+                )
+            ),
+            uncertainty_growth_per_sqrt_hour=float(
+                config.get(
+                    "uncertainty_growth_per_sqrt_hour",
+                    0.02,
+                )
+            ),
+        )
+
+    @staticmethod
+    def _build_manifest(
+        triage: pd.DataFrame,
+        audit: IngestionAudit,
+    ) -> CapabilityManifest:
+        if triage.empty:
+            return CapabilityManifest(
+                ingestion_mode=audit.ingestion_mode,
+                module_a_mode="BATCH_FALLBACK",
+                module_b_mode="INSUFFICIENT",
+                ood_status="UNKNOWN",
+                risk_mode="INSUFFICIENT",
+                rows_ingested=audit.canonicalized_rows,
+                components_processed=0,
+                parameters_processed=0,
+                unknown_parameters=(
+                    audit.unknown_parameters_quarantined
+                ),
+                irregular_timestamp_groups=(
+                    audit.irregular_timestamps_detected
+                ),
+            )
+
+        module_a_values = set(
+            triage[
+                "capability_mode"
+            ].astype(str)
+        )
+
+        if module_a_values == {"FULL"}:
+            module_a_mode = "FULL"
+        elif "FULL" in module_a_values or "DEGRADED" in module_a_values:
+            module_a_mode = "DEGRADED"
+        else:
+            module_a_mode = "BATCH_FALLBACK"
+
+        module_b_values = set(
+            triage[
+                "forecast_mode"
+            ].fillna("INSUFFICIENT")
+            .astype(str)
+        )
+
+        if (
+            "ML_FORECAST"
+            in module_b_values
+        ):
+            module_b_mode = "ML_FORECAST"
+        elif (
+            "COLD_START"
+            in module_b_values
+        ):
+            module_b_mode = "COLD_START"
+        else:
+            module_b_mode = "INSUFFICIENT"
+
+        ood_values = set(
+            triage[
+                "ood_status"
+            ].fillna("UNKNOWN")
+            .astype(str)
+        )
+
+        if "SEVERE" in ood_values:
+            ood_status = "SEVERE"
+        elif "MODERATE" in ood_values:
+            ood_status = "MODERATE"
+        elif ood_values == {"LOW"}:
+            ood_status = "LOW"
+        else:
+            ood_status = "UNKNOWN"
+
+        risk_mode = (
+            "EVIDENCE_FUSION"
+            if "risk_mode" in triage.columns
+            else "INSUFFICIENT"
+        )
+
+        return CapabilityManifest(
+            ingestion_mode=audit.ingestion_mode,
+            module_a_mode=module_a_mode,
+            module_b_mode=module_b_mode,
+            ood_status=ood_status,
+            risk_mode=risk_mode,
+            rows_ingested=audit.canonicalized_rows,
+            components_processed=int(
+                triage[
+                    "component_id"
+                ].nunique()
+            ),
+            parameters_processed=int(
+                triage[
+                    "parameter"
+                ].nunique()
+            ),
+            unknown_parameters=(
+                audit.unknown_parameters_quarantined
+            ),
+            irregular_timestamp_groups=(
+                audit.irregular_timestamps_detected
+            ),
+        )
 
 
-def progressive_screen_dataframe(df: pd.DataFrame, output_dir: str | Path, *, origins: tuple[float, ...] = (12.0, 24.0, 48.0, 72.0, 96.0, 120.0, 144.0, 168.0), target_horizon: float = 168.0, artifacts: PipelineArtifacts | None = None, **kwargs: Any) -> dict[str, Any]:
-    outdir = Path(output_dir); outdir.mkdir(parents=True, exist_ok=True); runs = {}; decision_rows = []
-    for origin in origins:
-        key = float(origin)
-        od = outdir / f"origin_{int(origin) if float(origin).is_integer() else str(origin).replace('.', '_')}h"
-        runs[key] = screen_dataframe(df, od, artifacts=artifacts, as_of_h=key, target_horizon=float(target_horizon), compute_features=False, render_explanations=False, **kwargs)
-        r = runs[key].screening[[c for c in ["part_id", "decision", "risk_score"] if c in runs[key].screening.columns]].copy()
-        r["origin_h"] = key
-        decision_rows.append(r)
-        
-    decisions = pd.concat(decision_rows, ignore_index=True) if decision_rows else pd.DataFrame(columns=["part_id", "decision", "risk_score", "origin_h"])
-    flags = decisions[decisions.decision.astype(str).isin(["REVIEW", "REJECT"])].sort_values(["part_id", "origin_h"])
-    first = flags.drop_duplicates("part_id", keep="first")[["part_id", "origin_h", "decision", "risk_score"]].rename(columns={"origin_h": "first_flag_time_h"}) if not flags.empty else pd.DataFrame(columns=["part_id", "first_flag_time_h", "decision", "risk_score"])
-    
-    parts = pd.DataFrame({"part_id": df["part_id"].astype(str).unique()}) if "part_id" in df.columns else pd.DataFrame()
-    lead = parts.merge(first, on="part_id", how="left") if not parts.empty else first.copy()
-    lead["lead_time_h"] = float(target_horizon) - pd.to_numeric(lead["first_flag_time_h"], errors="coerce")
-    
-    decisions.to_csv(outdir / "progressive_decisions.csv", index=False); lead.to_csv(outdir / "progressive_lead_time.csv", index=False)
-    return {"runs": runs, "decisions": decisions, "lead_time": lead}
+def run_screening(
+    data: pd.DataFrame,
+    parameters_path: str | Path = (
+        "configs/parameters.yaml"
+    ),
+    policy_path: str | Path = (
+        "configs/policy.yaml"
+    ),
+    target_horizon_h: float | None = None,
+) -> ScreeningResult:
+    pipeline = ACSPipeline(
+        parameters_path=parameters_path,
+        policy_path=policy_path,
+    )
 
-
-def progressive_screen_file(input_path: str | Path, output_dir: str | Path, **kwargs: Any) -> dict[str, Any]:
-    return progressive_screen_dataframe(pd.read_csv(input_path, low_memory=False), output_dir, **kwargs)
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="command", required=True)
-    s = sub.add_parser("screen"); s.add_argument("input"); s.add_argument("output_dir"); s.add_argument("--as-of", type=float, default=24.0); s.add_argument("--target-horizon", type=float, default=168.0); s.add_argument("--auto-train-missing", action="store_true"); s.add_argument("--progressive", action="store_true")
-    args = parser.parse_args()
-    if args.progressive:
-        r = progressive_screen_file(args.input, args.output_dir, target_horizon=args.target_horizon, auto_train_missing=args.auto_train_missing)
-        print(r["lead_time"].to_json(orient="records", indent=2))
-    else:
-        run = screen_file(args.input, args.output_dir, as_of_h=args.as_of, target_horizon=args.target_horizon, auto_train_missing=args.auto_train_missing)
-        print(run.screening[["part_id", "decision", "risk_score", "confidence", "ood_status"]].to_json(orient="records", indent=2))
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
+    return pipeline.run(
+        data,
+        target_horizon_h=target_horizon_h,
+    )

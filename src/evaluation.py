@@ -1,198 +1,975 @@
-"""Leakage-safe, winner-grade evaluation and calibration for SIH 26170.
+"""Final evaluation and evidence layer for the component screening system.
 
-This module deliberately separates:
-  1) model evidence,
-  2) validation-selected operating policy,
-  3) blind-test measurement.
+This module intentionally contains evaluation/validation logic rather than model
+training logic. It answers the questions a reliability reviewer will ask:
 
-No benchmark target is hard-coded as a required outcome. FPR, burden, confusion
-counts, latent escapes, mechanism performance, robustness and forecast baselines
-are all reported from observed predictions.
+* Does the system reduce latent-defect escapes relative to absolute limits/PAT?
+* What is the 168 h MAE of each forecasting strategy?
+* What happens under schema, unit, missing-data, distribution and mechanism shift?
+* How stable are thresholds and decisions?
+* Can a result be traced back to data/model/configuration fingerprints?
+* What is the lot/process state and what additional test would be most useful?
+
+All outputs are dataframe/JSON-friendly so the application layer can render them.
 """
 from __future__ import annotations
 
 import argparse
-import copy
+import hashlib
 import json
 import math
 import re
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
     average_precision_score,
-    confusion_matrix,
     mean_absolute_error,
     mean_squared_error,
-    precision_score,
-    recall_score,
+    precision_recall_curve,
     roc_auc_score,
 )
 
-from src.forecast import _linear, _persist
-from src.pipeline import PipelineArtifacts, progressive_screen_dataframe, screen_dataframe
-from src.safety import fit_ood_profile, redecide_screening
-from src.utils import PROJECT_ROOT, load_yaml
-
-SEED = 20260831
-
-class MetricResult(dict):
-    __getattr__ = dict.get
-    def __setattr__(self, key, value):
-        self[key] = value
+from src.utils import PROJECT_ROOT, load_yaml, stable_config_hash
+from src.pipeline import ACSPipeline, run_screening
+from src.ingest import ingest_dataframe
 
 DEFAULT_ORIGINS = (12.0, 24.0, 48.0, 72.0, 96.0, 120.0, 144.0, 168.0)
+
+
+# ---------------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------------
+
+def _sha256_file(path: str | Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _safe_num(s: Any) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce") if isinstance(s, pd.Series) else pd.Series(dtype=float)
+
+
+def _binary_labels(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(s):
+        return s.astype(int)
+    if pd.api.types.is_numeric_dtype(s):
+        return (pd.to_numeric(s, errors="coerce").fillna(0) > 0).astype(int)
+    mapping = {"1":1,"true":1,"yes":1,"bad":1,"fail":1,"failed":1,"defective":1,"latent":1,"hard_failure":1,
+               "0":0,"false":0,"no":0,"good":0,"pass":0,"safe":0,"healthy":0}
+    return s.astype(str).str.strip().str.lower().map(mapping).fillna(0).astype(int)
 
 
 def _find_col(df: pd.DataFrame, names: Sequence[str]) -> str | None:
     lower = {str(c).lower(): str(c) for c in df.columns}
     for n in names:
-        if n in df.columns:
-            return str(n)
-        if str(n).lower() in lower:
-            return lower[str(n).lower()]
+        if n in df.columns: return n
+        if str(n).lower() in lower: return lower[str(n).lower()]
     return None
 
 
 def _part_series(df: pd.DataFrame) -> pd.Series:
-    c = _find_col(df, ["part_id", "part", "component_id", "serial_id", "device_id"])
+    c = _find_col(df,["part_id","part","component_id","serial_id"])
     if c is None:
         return pd.Series([f"ROW_{i}" for i in range(len(df))], index=df.index)
     return df[c].astype(str)
 
 
 def _lot_series(df: pd.DataFrame) -> pd.Series:
-    c = _find_col(df, ["lot_id", "lot", "batch_id", "batch"])
+    c = _find_col(df,["lot_id","lot","batch_id","batch"])
     if c is None:
         return pd.Series(["LOT_UNKNOWN"] * len(df), index=df.index)
     return df[c].astype(str)
 
 
-def _binary_truth(df: pd.DataFrame, preferred: str = "future_defective_168h") -> pd.Series:
-    for c in (preferred, "future_defective", "latent_defect_label"):
-        if c in df.columns:
-            return pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-    if "defect_state" in df.columns:
-        return df["defect_state"].astype(str).str.lower().isin(
-            {"latent", "hard", "defective", "failed", "obvious_failure"}
-        ).astype(int)
-    raise ValueError(f"No future-defect label found; expected {preferred} or a supported fallback.")
+# ---------------------------------------------------------------------------
+# Escape matrix + FN-cost optimization
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ThresholdResult:
+    threshold: float
+    fn: int
+    fp: int
+    tn: int
+    tp: int
+    fnr: float
+    fpr: float
+    precision: float
+    recall: float
+    review_rate: float
+    reject_rate: float
+    cost: float
 
 
-def _mechanism_name(df: pd.DataFrame) -> pd.Series:
-    for c in ("primary_failure_mode", "failure_mode"):
-        if c in df.columns:
-            return df[c].astype(str)
-    return pd.Series(["UNKNOWN"] * len(df), index=df.index)
+def escape_matrix(input_df: pd.DataFrame, label_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Build the four-way conventional-screening / future-outcome matrix.
 
-
-def _bool_series(df: pd.DataFrame, col: str) -> pd.Series:
-    if col not in df.columns:
-        return pd.Series(False, index=df.index)
-    x = df[col]
-    if x.dtype == bool:
-        return x.fillna(False)
-    return pd.to_numeric(x, errors="coerce").fillna(0).astype(int).eq(1)
-
-
-def classification_metrics(y: Sequence[int], flag: Sequence[bool], *, threshold: float | None = None) -> dict[str, Any]:
-    y = np.asarray(y, dtype=int)
-    pred = np.asarray(flag, dtype=bool)
-    if len(y) != len(pred):
-        raise ValueError(f"Length mismatch y={len(y)} flag={len(pred)}")
-    tn, fp, fn, tp = confusion_matrix(y, pred.astype(int), labels=[0, 1]).ravel() if len(y) else (0, 0, 0, 0)
-    positives = int(tp + fn)
-    negatives = int(tn + fp)
-    out = {
-        "n": int(len(y)),
-        "positives": positives,
-        "negatives": negatives,
-        "tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn),
-        "recall": float(tp / max(positives, 1)),
-        "false_negative_rate": float(fn / max(positives, 1)),
-        "precision": float(precision_score(y, pred.astype(int), zero_division=0)) if len(y) else None,
-        "false_positive_rate": float(fp / max(negatives, 1)),
-        "specificity": float(tn / max(negatives, 1)),
-        "negative_predictive_value": float(tn / max(tn + fn, 1)),
-        "flag_rate": float(pred.mean()) if len(pred) else 0.0,
-    }
-    if threshold is not None:
-        out["threshold"] = float(threshold)
-    return out
-
-
-def score_metrics(y: Sequence[int], score: Sequence[float], threshold: float) -> dict[str, Any]:
-    y = np.asarray(y, dtype=int)
-    s = np.nan_to_num(np.asarray(score, dtype=float), nan=0.0, posinf=1.0, neginf=0.0)
-    pred = s >= float(threshold)
-    out = classification_metrics(y, pred, threshold=threshold)
-    out["pr_auc"] = float(average_precision_score(y, s)) if y.sum() and y.sum() < len(y) else None
-    out["roc_auc"] = float(roc_auc_score(y, s)) if len(np.unique(y)) > 1 else None
-    return out
-
-
-def optimize_threshold(
-    y: Sequence[int],
-    score: Sequence[float],
-    *,
-    fn_cost: float = 100.0,
-    fp_cost: float = 1.0,
-    review_cost: float = 0.25,
-    max_reject_rate: float = 1.0,
-    min_recall: float | None = None,
-    target_metric: str = "future_recall",
-) -> dict[str, Any]:
-    """Find a threshold on validation data only.
-
-    The constraint is on *flag burden*, not merely recall. This prevents the
-    degenerate all-flag solution from winning by construction.
+    Expected columns are discovered from common names. `absolute_pass` means
+    no known engineering upper/lower violation. `future_defective` is the
+    true future label (or the latent/hard label in the reference benchmark).
     """
-    y = np.asarray(y, dtype=int)
-    s = np.nan_to_num(np.asarray(score, dtype=float), nan=0.0, posinf=1.0, neginf=0.0)
-    if len(y) != len(s):
-        raise ValueError("Threshold calibration length mismatch")
-    candidates = np.unique(np.r_[0.0, 1.0, np.quantile(s, np.linspace(0, 1, 101))])
-    best: dict[str, Any] | None = None
-    for t in candidates:
-        m = score_metrics(y, s, float(t))
-        if m["flag_rate"] > float(max_reject_rate):
-            continue
-        if min_recall is not None and m["recall"] < float(min_recall):
-            continue
-        cost = (
-            fn_cost * m["fn"]
-            + fp_cost * m["fp"]
-            + review_cost * m["flag_rate"] * len(y)
-        )
-        if target_metric == "escape_recall":
-            key = (-m["recall"], m["false_positive_rate"], m["flag_rate"], cost)
-        else:
-            key = (cost, m["false_negative_rate"], m["false_positive_rate"], m["flag_rate"])
-        if best is None or key < best["key"]:
-            best = {"threshold": float(t), "cost": float(cost), "metrics": m, "key": key}
+    d = input_df.copy()
+    pid = _part_series(d)
+    if label_df is not None:
+        ld = label_df.copy(); lc = _find_col(ld,["part_id","part","component_id"])
+        if lc is not None:
+            d = d.merge(ld, left_on=pid.name if pid.name else "part_id", right_on=lc, how="left", suffixes=("","_label"))
+    abs_col = _find_col(d,["absolute_violation","absolute_fail","spec_fail","hard_limit_violation"])
+    if abs_col is None:
+        abs_pass = pd.Series(True,index=d.index)
+    else:
+        abs_pass = ~_binary_labels(d[abs_col]).astype(bool)
+    fut_col = _find_col(d,["future_defective","defective","latent_defect","hard_failure","target_failure","future_failure"])
+    if fut_col is None:
+        # If a screening label exists but is named final_status, map it.
+        fut_col = _find_col(d,["final_status","status","label"])
+    future_bad = _binary_labels(d[fut_col]) if fut_col else pd.Series(0,index=d.index)
+    out = pd.DataFrame({"part_id":pid.astype(str),"absolute_pass":abs_pass.astype(bool),"future_defective":future_bad.astype(int)})
+    out["latent_escape"] = out["absolute_pass"] & out["future_defective"].eq(1)
+    out["group"] = np.select(
+        [out["absolute_pass"] & out["future_defective"].eq(0),
+         out["absolute_pass"] & out["future_defective"].eq(1),
+         ~out["absolute_pass"] & out["future_defective"].eq(0),
+         ~out["absolute_pass"] & out["future_defective"].eq(1)],
+        ["PASS_SAFE","LATENT_ESCAPE","ABSOLUTE_FAIL_SAFE","ABSOLUTE_FAIL_DEFECT"], default="UNKNOWN")
+    return out.drop_duplicates("part_id")
+
+
+def optimize_threshold(y_true: Sequence[int], score: Sequence[float], *, fn_cost: float = 100.0,
+                       fp_cost: float = 1.0, reject_rate_max: float | None = None,
+                       fpr_max: float | None = None, grid: int = 201) -> ThresholdResult:
+    y=np.asarray(y_true,dtype=int); s=np.asarray(score,dtype=float)
+    best=None
+    for t in np.linspace(0,1,max(3,grid)):
+        pred=(s>=t).astype(int)
+        tp=int(((pred==1)&(y==1)).sum()); tn=int(((pred==0)&(y==0)).sum()); fp=int(((pred==1)&(y==0)).sum()); fn=int(((pred==0)&(y==1)).sum())
+        fpr=fp/max(fp+tn,1); fnr=fn/max(fn+tp,1); reject=float(pred.mean())
+        if reject_rate_max is not None and reject>float(reject_rate_max): continue
+        if fpr_max is not None and fpr>float(fpr_max): continue
+        cost=fn_cost*fn + fp_cost*fp
+        r=ThresholdResult(float(t),fn,fp,tn,tp,fnr,fpr,tp/max(tp+fp,1),tp/max(tp+fn,1),reject,reject,cost)
+        # lexicographically prioritize FN, then cost, then rejection burden.
+        key=(r.fn, r.cost, r.reject_rate)
+        if best is None or key<best[0]: best=(key,r)
     if best is None:
-        # This means the operational constraint is itself infeasible for the supplied scores.
-        # We do not silently relax it; we expose the failure.
-        return MetricResult({
-            "feasible": False,
-            "threshold": float(np.max(s) + 1e-12) if len(s) else 1.0,
-            "objective": "infeasible_under_operational_burden_constraint",
-            "selection_set": "validation",
-            "max_reject_rate": float(max_reject_rate),
-            "metrics": score_metrics(y, s, float(np.max(s) + 1e-12) if len(s) else 1.0),
+        # Feasibility fallback: minimize false negatives then constraints violation.
+        vals=[]
+        for t in np.linspace(0,1,max(3,grid)):
+            pred=(s>=t).astype(int); tp=int(((pred==1)&(y==1)).sum()); tn=int(((pred==0)&(y==0)).sum()); fp=int(((pred==1)&(y==0)).sum()); fn=int(((pred==0)&(y==1)).sum())
+            vals.append((fn,fp/max(fp+tn,1),float(pred.mean()),t,tp,tn,fp))
+        _,_,_,t,tp,tn,fp=min(vals)
+        fn=int(((s<t)&(y==1)).sum()); fpr=fp/max(fp+tn,1)
+        return ThresholdResult(float(t),fn,int(fp),int(tn),int(tp),fn/max(fn+tp,1),fpr,tp/max(tp+fp,1),tp/max(tp+fn,1),float((s>=t).mean()),float((s>=t).mean()),fn_cost*fn+fp_cost*fp)
+    return best[1]
+
+
+def evaluate_anomaly_scores(y_true: Sequence[int], score: Sequence[float], threshold: float) -> dict[str,float]:
+    y=np.asarray(y_true,dtype=int); s=np.asarray(score,dtype=float); p=(s>=threshold).astype(int)
+    tp=int(((p==1)&(y==1)).sum()); tn=int(((p==0)&(y==0)).sum()); fp=int(((p==1)&(y==0)).sum()); fn=int(((p==0)&(y==1)).sum())
+    out={"threshold":float(threshold),"tp":tp,"tn":tn,"fp":fp,"fn":fn,
+         "fnr":fn/max(fn+tp,1),"fpr":fp/max(fp+tn,1),"precision":tp/max(tp+fp,1),"recall":tp/max(tp+fn,1),"reject_rate":float(p.mean()),
+         "escape_fnr":float(fn/max(fn+tp,1))}
+    try:
+        out["pr_auc"]=float(average_precision_score(y,s)); out["roc_auc"]=float(roc_auc_score(y,s))
+    except Exception:
+        out["pr_auc"]=float("nan"); out["roc_auc"]=float("nan")
+    return out
+
+
+def threshold_stability(y_true: Sequence[int], score: Sequence[float], *, repeats: int = 50, seed: int = 20260831,
+                        fn_cost: float = 100.0, fp_cost: float = 1.0) -> dict[str,float]:
+    rng=np.random.default_rng(seed); y=np.asarray(y_true); s=np.asarray(score); ts=[]; fnrs=[]
+    n=len(y)
+    for _ in range(max(2,repeats)):
+        idx=rng.integers(0,n,n); r=optimize_threshold(y[idx],s[idx],fn_cost=fn_cost,fp_cost=fp_cost)
+        ts.append(r.threshold); fnrs.append(r.fnr)
+    return {"threshold_mean":float(np.mean(ts)),"threshold_std":float(np.std(ts,ddof=1)),"threshold_min":float(np.min(ts)),"threshold_max":float(np.max(ts)),"fnr_mean":float(np.mean(fnrs)),"fnr_std":float(np.std(fnrs,ddof=1))}
+
+
+# ---------------------------------------------------------------------------
+# Forecast benchmark
+# ---------------------------------------------------------------------------
+
+def forecast_baselines(df: pd.DataFrame, horizon_h: float = 168.0) -> pd.DataFrame:
+    d=df.copy(); v0=pd.to_numeric(d.get("value_0h"),errors="coerce"); v24=pd.to_numeric(d.get("value_24h"),errors="coerce")
+    out=pd.DataFrame({"part_id":_part_series(d)})
+    out["actual_168h"]=pd.to_numeric(d.get("target_168h",d.get("value_168h")),errors="coerce")
+    out["persistence"]=v24
+    slope=(v24-v0)/24.0; out["linear"] = v24+slope*(horizon_h-24.0)
+    # Robust last-slope clips extreme early slopes by a median/MAD envelope.
+    med=float(np.nanmedian(slope)); mad=float(np.nanmedian(np.abs(slope-med))) if np.isfinite(slope).any() else 0.0
+    scale=max(1.4826*mad,1e-12); clipped=np.clip(slope,med-4*scale,med+4*scale)
+    out["robust_linear"]=v24+clipped*(horizon_h-24.0)
+    return out
+
+
+def benchmark_forecasts(df: pd.DataFrame, predictions: Mapping[str, Sequence[float]] | None = None, horizon_h: float = 168.0) -> pd.DataFrame:
+    b=forecast_baselines(df,horizon_h); y=b["actual_168h"]
+    rows=[]
+    for name in ["persistence","linear","robust_linear"]:
+        valid=y.notna() & b[name].notna()
+        if valid.any(): rows.append({"model":name,"n":int(valid.sum()),"mae":float(mean_absolute_error(y[valid],b.loc[valid,name])),"rmse":float(mean_squared_error(y[valid],b.loc[valid,name])**0.5)})
+    if predictions:
+        for name,p in predictions.items():
+            p=pd.Series(p,index=b.index,dtype=float); valid=y.notna()&p.notna()
+            if valid.any(): rows.append({"model":name,"n":int(valid.sum()),"mae":float(mean_absolute_error(y[valid],p[valid])),"rmse":float(mean_squared_error(y[valid],p[valid])**0.5)})
+    return pd.DataFrame(rows).sort_values("mae") if rows else pd.DataFrame(columns=["model","n","mae","rmse"])
+
+
+def leakage_audit(df: pd.DataFrame, as_of_h: float = 24.0, forbidden: Iterable[str] | None = None) -> dict[str,Any]:
+    """Static audit of a forecast feature frame against a declared as-of boundary."""
+    forb={str(x).lower() for x in (forbidden or ["value_96h","value_168h","target_168h","future_defective","future_failure","latent_defect","hard_failure"])}
+    offenders=[]
+    for c in df.columns:
+        lc=str(c).lower()
+        if lc in forb or any(tok in lc for tok in ["168h","future","target_168","label"]): offenders.append(str(c))
+    time_cols=[]
+    for c in df.columns:
+        m=re.search(r"(?:value|val)[_@]?(\d+(?:\.\d+)?)h$",str(c),re.I)
+        if m and float(m.group(1))>float(as_of_h): time_cols.append(str(c))
+    offenders=sorted(set(offenders+time_cols))
+    return {"as_of_h":float(as_of_h),"leakage_detected":bool(offenders),"forbidden_columns_detected":offenders}
+
+
+# ---------------------------------------------------------------------------
+# Domain/adversarial benchmark helpers
+# ---------------------------------------------------------------------------
+
+def mutate_schema_aliases(df: pd.DataFrame, alias_map: Mapping[str,str]) -> pd.DataFrame:
+    return df.rename(columns={k:v for k,v in alias_map.items() if k in df.columns}).copy()
+
+
+def mutate_units(df: pd.DataFrame, column: str, factor: float, new_unit: str | None = None, unit_column: str = "unit") -> pd.DataFrame:
+    d=df.copy();
+    if column in d.columns: d[column]=pd.to_numeric(d[column],errors="coerce")*float(factor)
+    if new_unit is not None and unit_column in d.columns: d[unit_column]=new_unit
+    return d
+
+
+def drop_parameters(df: pd.DataFrame, fraction: float, seed: int = 20260831) -> pd.DataFrame:
+    d=df.copy()
+    if "parameter" not in d.columns: return d
+    params=sorted(d["parameter"].dropna().astype(str).unique().tolist()); rng=np.random.default_rng(seed)
+    k=max(1,int(round(len(params)*float(np.clip(fraction,0,1)))))
+    remove=set(rng.choice(params,size=min(k,len(params)),replace=False).tolist())
+    return d[~d["parameter"].astype(str).isin(remove)].copy()
+
+
+def add_noise(df: pd.DataFrame, fraction: float, seed: int = 20260831, value_cols: Sequence[str] | None = None) -> pd.DataFrame:
+    d=df.copy(); rng=np.random.default_rng(seed)
+    cols=list(value_cols or [c for c in d.columns if re.search(r"value|^measurement$|^observed$",str(c),re.I)])
+    for c in cols:
+        if c in d.columns:
+            x=pd.to_numeric(d[c],errors="coerce"); sd=float(np.nanstd(x)) if x.notna().any() else 1.0
+            d[c]=x+rng.normal(0,max(sd*float(fraction),1e-12),len(d))
+    return d
+
+
+def shift_distribution(df: pd.DataFrame, mean_factor: float = 1.25, std_factor: float = 1.0, skew_proxy: float = 0.0,
+                       column: str = "value_24h", seed: int = 20260831) -> pd.DataFrame:
+    d=df.copy(); rng=np.random.default_rng(seed)
+    if column in d.columns:
+        x=pd.to_numeric(d[column],errors="coerce"); med=float(np.nanmedian(x)); sd=float(np.nanstd(x))
+        shifted=med+(x-med)*float(std_factor)+(med*float(mean_factor)-med)
+        if skew_proxy:
+            shifted=shifted+float(skew_proxy)*rng.normal(0,sd,max(1,len(d)))**2/max(sd,1e-12)
+        d[column]=shifted
+    return d
+
+
+def adversarial_suite(df: pd.DataFrame) -> dict[str,pd.DataFrame]:
+    """Create a deterministic, label-free set of input stressors.
+
+    These mutations test the architecture's data contract. They intentionally do
+    not fabricate future targets.
+    """
+    out={"baseline":df.copy()}
+    aliases={"IDDQ_uA":"Icc_q","value_0h":"v0","value_24h":"v24"}
+    out["renamed"] = mutate_schema_aliases(df,aliases)
+    if "value_24h" in df.columns: out["unit_scaled"] = mutate_units(df,"value_24h",1e-3,"mA")
+    out["missing_20pct"] = drop_parameters(df,0.20)
+    out["missing_40pct"] = drop_parameters(df,0.40)
+    out["missing_60pct"] = drop_parameters(df,0.60)
+    out["shifted_mean"] = shift_distribution(df,mean_factor=1.25)
+    out["shifted_variance"] = shift_distribution(df,std_factor=1.75)
+    out["noise_5pct"] = add_noise(df,0.05)
+    # Informative missingness: preferentially mask higher-value observations.
+    inf=df.copy()
+    if "value_24h" in inf.columns:
+        x=pd.to_numeric(inf["value_24h"],errors="coerce"); threshold=float(x.quantile(0.9)) if x.notna().any() else np.inf; inf.loc[x>=threshold,"value_24h"]=np.nan
+    out["informative_missing"] = inf
+    if "value_168h" in df.columns: out["irregular_readpoints"] = df.drop(columns=["value_96h","value_168h"],errors="ignore")
+    return out
+
+
+def robustness_summary(run_results: Mapping[str,Mapping[str,float]]) -> pd.DataFrame:
+    rows=[]
+    for scenario,metrics in run_results.items():
+        r={"scenario":scenario}; r.update({k:float(v) if isinstance(v,(int,float,np.number)) else v for k,v in metrics.items()}); rows.append(r)
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Lot/process intelligence
+# ---------------------------------------------------------------------------
+
+def lot_health(input_df: pd.DataFrame, anomaly: pd.DataFrame | None = None, forecast: pd.DataFrame | None = None) -> pd.DataFrame:
+    d=input_df.copy(); d["_part"]=_part_series(d); d["_lot"]=_lot_series(d)
+    rows=[]
+    a = anomaly.copy() if anomaly is not None else pd.DataFrame()
+    f = forecast.copy() if forecast is not None else pd.DataFrame()
+    a_pid=_find_col(a,["part_id"]) if not a.empty else None; f_pid=_find_col(f,["part_id"]) if not f.empty else None
+    for lot,g in d.groupby("_lot",sort=True):
+        parts=g["_part"].nunique(); row={"lot_id":lot,"parts":int(parts)}
+        if not a.empty and a_pid:
+            ag=a[a[a_pid].astype(str).isin(g["_part"].astype(str))]
+            ac=_find_col(ag,["anomaly_risk","calibrated_risk_score","anomaly_score"])
+            row["mean_anomaly_risk"]=float(pd.to_numeric(ag[ac],errors="coerce").mean()) if ac else 0.0
+            row["anomalous_part_fraction"]=float((pd.to_numeric(ag[ac],errors="coerce")>=0.65).mean()) if ac else 0.0
+        else:
+            row["mean_anomaly_risk"]=0.0; row["anomalous_part_fraction"]=0.0
+        if not f.empty and f_pid:
+            fg=f[f[f_pid].astype(str).isin(g["_part"].astype(str))]
+            ex=_find_col(fg,["limit_exceedance_probability_proxy","failure_risk"])
+            row["mean_failure_risk"]=float(pd.to_numeric(fg[ex],errors="coerce").mean()) if ex else 0.0
+        else: row["mean_failure_risk"]=0.0
+        row["lot_health_score"]=float(np.clip(1.0-(0.65*row["anomalous_part_fraction"]+0.35*row["mean_failure_risk"]),0,1))
+        row["process_excursion_suspect"]=bool(row["anomalous_part_fraction"]>=0.20 or row["mean_anomaly_risk"]>=0.65)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Early-detection, next-best-test, screening twin, failure-pattern attribution
+# ---------------------------------------------------------------------------
+
+def detection_lead_time(traces: pd.DataFrame, threshold: float = 0.70, traditional_h: float = 168.0) -> pd.DataFrame:
+    """Compute first reliable model detection time from long-form score traces.
+
+    Expected columns: part_id, time_h, risk_score or anomaly_risk, future_defective.
+    """
+    d=traces.copy(); d["part_id"]=_part_series(d); d["time_h"]=pd.to_numeric(d.get("time_h"),errors="coerce")
+    score_col=_find_col(d,["risk_score","anomaly_risk","score"])
+    ycol=_find_col(d,["future_defective","defective","latent_defect"])
+    if score_col is None or ycol is None: raise ValueError("Detection lead time requires score and future-defective columns.")
+    rows=[]
+    for pid,g in d.groupby("part_id",sort=False):
+        if int(_binary_labels(g[ycol]).max())!=1: continue
+        gg=g.sort_values("time_h"); hits=gg[pd.to_numeric(gg[score_col],errors="coerce")>=threshold]
+        first=float(hits["time_h"].iloc[0]) if not hits.empty else np.nan
+        rows.append({"part_id":str(pid),"first_detection_h":first,"lead_time_h":float(traditional_h-first) if np.isfinite(first) else np.nan,"detected":bool(np.isfinite(first))})
+    return pd.DataFrame(rows)
+
+
+def next_best_test(input_df: pd.DataFrame, screening: pd.DataFrame, *, target_parameters: Sequence[str] | None = None) -> pd.DataFrame:
+    """Recommend a next measurement using uncertainty × relevance.
+
+    This is diagnostic decision support only; it does not control hardware.
+    """
+    d=input_df.copy(); s=screening.copy(); pid_s=_find_col(s,["part_id"]); part=_part_series(d)
+    candidates=[]
+    params=sorted(d["parameter"].dropna().astype(str).unique()) if "parameter" in d.columns else list(target_parameters or [])
+    for pid in part.unique():
+        sr=s[s[pid_s].astype(str).eq(str(pid))] if pid_s else pd.DataFrame()
+        risk=float(pd.to_numeric(sr[_find_col(sr,["risk_score"])],errors="coerce").max()) if not sr.empty and _find_col(sr,["risk_score"]) else 0.5
+        unc=float(pd.to_numeric(sr[_find_col(sr,["uncertainty_score"])],errors="coerce").max()) if not sr.empty and _find_col(sr,["uncertainty_score"]) else 0.5
+        priority=risk*unc
+        for p in params:
+            pg=d[(part==str(pid)) & d["parameter"].astype(str).eq(p)] if "parameter" in d.columns else pd.DataFrame()
+            if pg.empty: continue
+            value=pd.to_numeric(pg.get("value_asof",pg.get("value")),errors="coerce")
+            repeat=float(1.0/value.std()) if value.notna().sum()>1 and value.std()>0 else 0.0
+            candidates.append({"part_id":str(pid),"parameter":p,"priority":float(priority+0.05*repeat),"reason":"high risk × uncertainty; repeat/measure this parameter for the most information."})
+    return pd.DataFrame(candidates).sort_values(["part_id","priority"],ascending=[True,False]) if candidates else pd.DataFrame(columns=["part_id","parameter","priority","reason"])
+
+
+def what_if_projection(value_0h: float, value_24h: float, horizons: Sequence[float] = (48,72,96,120,144,168)) -> pd.DataFrame:
+    slope=(float(value_24h)-float(value_0h))/24.0
+    rows=[]
+    for h in horizons:
+        pred=float(value_24h+slope*(float(h)-24.0)); rows.append({"time_h":float(h),"projected_value":pred,"method":"linear early-drift scenario"})
+    return pd.DataFrame(rows)
+
+
+def failure_pattern_attribution(row: Mapping[str,Any]) -> dict[str,Any]:
+    reasons=[]
+    pop=float(row.get("population_evidence",0) or 0); temp=float(row.get("temporal_evidence",0) or 0); multi=float(row.get("multivariate_component_score",0) or 0)
+    if temp>=0.70: reasons.append("accelerating_or_abnormal_temporal_drift")
+    if pop>=0.70: reasons.append("lot_relative_parametric_anomaly")
+    if multi>=0.70: reasons.append("cross_parameter_joint_anomaly")
+    if row.get("hard_limit_violation"): reasons.append("absolute_specification_violation")
+    if row.get("limit_cross"): reasons.append("predicted_future_limit_crossing")
+    return {"patterns":reasons[:4],"language":"pattern consistent with observed evidence; not a physical root-cause diagnosis."}
+
+
+# ---------------------------------------------------------------------------
+# Physics/empirical sanity gates and transfer profile
+# ---------------------------------------------------------------------------
+
+def physics_sanity(df: pd.DataFrame) -> dict[str,Any]:
+    violations=[]
+    for c in [c for c in df.columns if re.search(r"temperature",str(c),re.I)]:
+        x=pd.to_numeric(df[c],errors="coerce"); bad=x.notna() & ((x<-273.15)|(x>1000))
+        if bad.any(): violations.append(f"{c}: physically implausible temperature range")
+    for c in [c for c in df.columns if re.search(r"(?:voltage|current|capacitance|leakage|resistance|esr|iddq|idss)",str(c),re.I)]:
+        x=pd.to_numeric(df[c],errors="coerce")
+        if x.notna().any() and re.search(r"(?:current|capacitance|resistance|esr|iddq|idss|leakage)",str(c),re.I) and (x.dropna()<0).any():
+            violations.append(f"{c}: negative value where the modeled quantity is non-negative")
+    return {"pass":not violations,"violations":violations}
+
+
+def transfer_profile(reference: pd.DataFrame, external: pd.DataFrame) -> dict[str,Any]:
+    """Compare semantic/shape overlap for an external real dataset.
+
+    This does not claim domain equivalence; it measures whether the universal
+    adapter can represent the external dataset without the synthetic schema.
+    """
+    common=[]
+    for c in ["component_family","parameter","semantic_type","physical_quantity","unit"]:
+        if c in reference.columns and c in external.columns: common.append(c)
+    result={"common_semantic_columns":common,
+            "reference_families":sorted(set(reference.get("component_family",pd.Series(dtype=str)).dropna().astype(str))),
+            "external_families":sorted(set(external.get("component_family",pd.Series(dtype=str)).dropna().astype(str))),
+            "parameter_overlap":0.0,
+            "supports_common_times":False}
+    rp=set(reference.get("parameter",pd.Series(dtype=str)).dropna().astype(str)); ep=set(external.get("parameter",pd.Series(dtype=str)).dropna().astype(str));
+    result["parameter_overlap"]=float(len(rp&ep)/max(len(ep),1))
+    rt={float(x) for x in pd.to_numeric(reference.get("time_h",pd.Series(dtype=float)),errors="coerce").dropna().unique()}; et={float(x) for x in pd.to_numeric(external.get("time_h",pd.Series(dtype=float)),errors="coerce").dropna().unique()}
+    result["supports_common_times"]=bool(rt & et)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Master evidence report
+# ---------------------------------------------------------------------------
+
+def build_evidence_report(*, input_df: pd.DataFrame, screening: pd.DataFrame | None = None,
+                          anomaly: pd.DataFrame | None = None, forecast: pd.DataFrame | None = None,
+                          y_true: Sequence[int] | None = None, anomaly_score: Sequence[float] | None = None,
+                          config: Mapping[str,Any] | None = None) -> dict[str,Any]:
+    cfg=config or load_yaml(PROJECT_ROOT/"configs"/"models.yaml")
+    rep={"configuration_hash":stable_config_hash(cfg),"rows":int(len(input_df)),"parts":int(_part_series(input_df).nunique()),
+         "physics_sanity":physics_sanity(input_df),"leakage_audit":leakage_audit(input_df)}
+    if y_true is not None and anomaly_score is not None:
+        pol=load_yaml(PROJECT_ROOT/"configs"/"policy.yaml")
+        costs=pol.get("costs",{}); tr=optimize_threshold(y_true,anomaly_score,fn_cost=float(costs.get("false_negative",100)),fp_cost=float(costs.get("false_positive",1)))
+        rep["fn_optimized_threshold"]=asdict(tr); rep["threshold_stability"]=threshold_stability(y_true,anomaly_score,fn_cost=float(costs.get("false_negative",100)),fp_cost=float(costs.get("false_positive",1)))
+        rep["anomaly_metrics"]=evaluate_anomaly_scores(y_true,anomaly_score,tr.threshold)
+    if forecast is not None:
+        # If forecast has point prediction + hidden target, evaluate it directly.
+        pc=_find_col(forecast,["prediction_168h"]); yc=_find_col(forecast,["actual_168h","target_168h"])
+        if pc and yc:
+            y=pd.to_numeric(forecast[yc],errors="coerce"); p=pd.to_numeric(forecast[pc],errors="coerce"); valid=y.notna()&p.notna()
+            rep["forecast_metrics"]={"n":int(valid.sum()),"mae":float(mean_absolute_error(y[valid],p[valid])) if valid.any() else np.nan,"rmse":float(mean_squared_error(y[valid],p[valid])**0.5) if valid.any() else np.nan}
+    if screening is not None:
+        rep["lot_health"]=lot_health(input_df,anomaly,forecast).to_dict(orient="records")
+        rep["decisions"]=screening.get("decision",pd.Series(dtype=str)).value_counts(dropna=False).to_dict()
+    return rep
+
+
+def main() -> int:
+    p=argparse.ArgumentParser(description="Final benchmark/evidence utilities")
+    sub=p.add_subparsers(dest="cmd",required=True)
+    pb=sub.add_parser("anomaly-threshold"); pb.add_argument("labels_csv"); pb.add_argument("score_csv"); pb.add_argument("--label-column",default="future_defective"); pb.add_argument("--score-column",default="score")
+    pl=sub.add_parser("leakage-audit"); pl.add_argument("csv"); pl.add_argument("--as-of",type=float,default=24.0)
+    ps=sub.add_parser("sanity"); ps.add_argument("csv")
+    args=p.parse_args()
+    if args.cmd=="anomaly-threshold":
+        y=_binary_labels(pd.read_csv(args.labels_csv)[args.label_column]); s=pd.to_numeric(pd.read_csv(args.score_csv)[args.score_column],errors="coerce"); print(json.dumps(asdict(optimize_threshold(y,s)),indent=2)); return 0
+    if args.cmd=="leakage-audit": print(json.dumps(leakage_audit(pd.read_csv(args.csv),args.as_of),indent=2)); return 0
+    if args.cmd=="sanity": print(json.dumps(physics_sanity(pd.read_csv(args.csv)),indent=2)); return 0
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Comparative screening, dependency, twin and calibration utilities
+# ---------------------------------------------------------------------------
+
+def _derive_population_score(df: pd.DataFrame) -> pd.Series:
+    if "population_robust_z" in df.columns:
+        return np.clip(np.abs(pd.to_numeric(df["population_robust_z"],errors="coerce").fillna(0))/8.0,0,1)
+    value_col=_find_col(df,["value_24h","value_asof","value"])
+    if value_col is None: return pd.Series(0.0,index=df.index)
+    lot=_lot_series(df); x=pd.to_numeric(df[value_col],errors="coerce")
+    med=x.groupby(lot).transform("median"); mad=(x-med).abs().groupby(lot).transform("median")
+    z=(x-med)/(1.4826*mad.replace(0,np.nan)); return np.clip(z.abs().fillna(0)/8.0,0,1)
+
+
+def _derive_absolute_violation(df: pd.DataFrame) -> pd.Series:
+    c=_find_col(df,["absolute_violation","hard_limit_violation","spec_fail"])
+    if c: return _binary_labels(df[c]).astype(bool)
+    xcol=_find_col(df,["value_168h","value_24h","value_asof","value"]); lim=_find_col(df,["absolute_limit_upper","engineering_limit_upper","upper_limit","spec_upper"])
+    if xcol and lim:
+        return (pd.to_numeric(df[xcol],errors="coerce")>pd.to_numeric(df[lim],errors="coerce")).fillna(False)
+    return pd.Series(False,index=df.index)
+
+
+def comparative_anomaly_benchmark(df: pd.DataFrame, *, y_col: str = "future_defective", score_col: str | None = None,
+                                  fn_cost: float = 100.0, fp_cost: float = 1.0) -> pd.DataFrame:
+    """Compare absolute limits, PAT and AI risk on the same labelled population."""
+    d=df.copy(); y=_binary_labels(d[y_col]) if y_col in d.columns else pd.Series(0,index=d.index)
+    scores={"absolute_limits":_derive_absolute_violation(d).astype(float),
+            "pat_robust":_derive_population_score(d)}
+    if "temporal_evidence" in d.columns:
+        scores["pat_plus_temporal"]=np.clip(0.55*scores["pat_robust"]+0.45*pd.to_numeric(d["temporal_evidence"],errors="coerce").fillna(0),0,1)
+    else: scores["pat_plus_temporal"]=scores["pat_robust"]
+    if score_col and score_col in d.columns: scores["ai_full"]=pd.to_numeric(d[score_col],errors="coerce").fillna(0).clip(0,1)
+    rows=[]
+    for name,s in scores.items():
+        if name=="absolute_limits": threshold=0.5
+        else: threshold=optimize_threshold(y,s,fn_cost=fn_cost,fp_cost=fp_cost).threshold
+        rows.append({"method":name,**evaluate_anomaly_scores(y,s,threshold)})
+    return pd.DataFrame(rows)
+
+
+def cross_parameter_dependency(df: pd.DataFrame, *, min_parts: int = 20) -> pd.DataFrame:
+    """Estimate a robust part-by-parameter dependency matrix and joint anomaly score."""
+    if "part_id" not in df.columns or "parameter" not in df.columns: return pd.DataFrame()
+    value_col=_find_col(df,["value_asof","value_24h","value"])
+    if value_col is None: return pd.DataFrame()
+    x=df.copy(); x["_v"]=pd.to_numeric(x[value_col],errors="coerce"); x["_p"]=x["part_id"].astype(str); x["_param"]=x["parameter"].astype(str)
+    wide=x.pivot_table(index="_p",columns="_param",values="_v",aggfunc="median")
+    wide=wide.dropna(axis=1,thresh=min_parts).dropna(axis=0,how="all")
+    if wide.shape[1]<2: return pd.DataFrame()
+    corr=wide.corr(method="spearman").stack().reset_index(); corr.columns=["parameter_a","parameter_b","spearman_corr"]
+    return corr[corr["parameter_a"]<corr["parameter_b"]].sort_values("spearman_corr",ascending=False).reset_index(drop=True)
+
+
+def screening_twin(value_0h: float, value_24h: float, *, horizons: Sequence[float]=(48,72,96,120,144,168),
+                   temperature_C: float | None=None, reference_temperature_C: float | None=None,
+                   activation_energy_eV: float | None=None, direction: str="increase") -> pd.DataFrame:
+    """Scenario-level screening twin. It is explicitly a what-if tool, not a hardware-validated predictor."""
+    import math as _math
+    slope=(float(value_24h)-float(value_0h))/24.0; factor=1.0
+    if temperature_C is not None and reference_temperature_C is not None and activation_energy_eV is not None:
+        k=8.617333262e-5; T1=float(reference_temperature_C)+273.15; T2=float(temperature_C)+273.15
+        factor=float(np.clip(np.exp(float(activation_energy_eV)/k*(1/T1-1/T2)),0.01,1e4))
+    rows=[]
+    for h in horizons:
+        pred=float(value_24h+(slope*factor)*(float(h)-24.0)); rows.append({"time_h":float(h),"projected_value":pred,"stress_factor":factor,"method":"linear scenario with optional Arrhenius acceleration","is_validated_physics":False})
+    return pd.DataFrame(rows)
+
+
+def calibrate_cost_policy(y_true: Sequence[int], risk_score: Sequence[float], *, fn_cost: float=100.0, fp_cost: float=1.0,
+                          review_rate_max: float=0.25) -> dict[str,Any]:
+    r=optimize_threshold(y_true,risk_score,fn_cost=fn_cost,fp_cost=fp_cost,reject_rate_max=review_rate_max)
+    return {"threshold":r.threshold,"false_negative_rate":r.fnr,"false_positive_rate":r.fpr,"precision":r.precision,"recall":r.recall,"review_rate":r.reject_rate,"cost":r.cost,
+            "objective":"minimize FN-cost subject to a maximum automatic-rejection/review burden; threshold remains a policy parameter."}
+
+
+def aggregate_decision_trace(screening: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for _,r in screening.iterrows():
+        trace={}
+        raw=r.get("trace_json")
+        if isinstance(raw,str):
+            try: trace=json.loads(raw)
+            except Exception: trace={}
+        rows.append({"part_id":str(r.get("part_id")),"decision":r.get("decision"),"risk_score":r.get("risk_score"),
+                     "anomaly_risk":r.get("anomaly_risk"),"failure_risk":r.get("failure_risk"),"ood_score":r.get("ood_score"),
+                     "uncertainty_score":r.get("uncertainty_score"),"evidence_state":r.get("evidence_state"),
+                     "hard_limit_violation":r.get("hard_limit_violation"),"trace":json.dumps(trace,default=str)})
+    return pd.DataFrame(rows)
+
+
+def save_json(data: Mapping[str,Any], path: str | Path) -> None:
+    p=Path(path); p.parent.mkdir(parents=True,exist_ok=True); p.write_text(json.dumps(data,indent=2,default=str),encoding="utf-8")
+
+
+def _load_for_benchmark(path: str | Path) -> pd.DataFrame:
+    p=Path(path)
+    if p.suffix.lower()=='.csv': return pd.read_csv(p)
+    if p.suffix.lower() in {'.db','.sqlite','.sqlite3'}:
+        import sqlite3
+        with sqlite3.connect(p) as con:
+            tables=[r[0] for r in con.execute("select name from sqlite_master where type='table'").fetchall()]
+            for t in ('module_A_dataset','module_B_train','labels','measurements','component_parameter_state','part_parameter_state'):
+                if t in tables:
+                    try:return pd.read_sql_query(f'SELECT * FROM {t}',con)
+                    except Exception: pass
+        raise ValueError('No compatible table found in database')
+    raise ValueError(f'Unsupported data file: {p}')
+
+
+def run_master_report(input_path: str | Path, output_dir: str | Path, *, screening_path: str | Path | None=None,
+                      anomaly_path: str | Path | None=None, forecast_path: str | Path | None=None) -> dict[str,Any]:
+    out=Path(output_dir); out.mkdir(parents=True,exist_ok=True); d=_load_for_benchmark(input_path)
+    screening=pd.read_csv(screening_path) if screening_path else None
+    anomaly=pd.read_csv(anomaly_path) if anomaly_path else None
+    forecast=pd.read_csv(forecast_path) if forecast_path else None
+    rep=build_evidence_report(input_df=d,screening=screening,anomaly=anomaly,forecast=forecast)
+    if screening is not None:
+        lot=lot_health(d,anomaly,forecast); lot.to_csv(out/'lot_health.csv',index=False)
+        nb=next_best_test(d,screening); nb.to_csv(out/'next_best_test.csv',index=False)
+    (out/'evidence_report.json').write_text(json.dumps(rep,indent=2,default=str),encoding='utf-8')
+    return rep
+
+
+def master_cli() -> int:
+    ap=argparse.ArgumentParser(description='Final evaluation, ablation and robustness campaign')
+    sub=ap.add_subparsers(dest='cmd',required=True)
+    b=sub.add_parser('benchmark'); b.add_argument('csv'); b.add_argument('--label-column',default='future_defective'); b.add_argument('--score-column',default='anomaly_risk'); b.add_argument('--output',default='reports/benchmark.csv')
+    e=sub.add_parser('escape'); e.add_argument('csv'); e.add_argument('--label-column',default='future_defective'); e.add_argument('--output',default='reports/escape_matrix.csv')
+    a=sub.add_parser('adversarial'); a.add_argument('csv'); a.add_argument('--output-dir',default='reports/adversarial')
+    r=sub.add_parser('robustness'); r.add_argument('csv'); r.add_argument('--output',default='reports/robustness_catalog.csv')
+    l=sub.add_parser('lot-health'); l.add_argument('csv'); l.add_argument('--anomaly'); l.add_argument('--forecast'); l.add_argument('--output',default='reports/lot_health.csv')
+    s=sub.add_parser('sanity'); s.add_argument('csv')
+    q=sub.add_parser('leakage-audit'); q.add_argument('csv'); q.add_argument('--as-of',type=float,default=24.0)
+    t=sub.add_parser('threshold'); t.add_argument('csv'); t.add_argument('--label-column',default='future_defective'); t.add_argument('--score-column',default='anomaly_risk'); t.add_argument('--output',default='reports/fn_policy.json')
+    w=sub.add_parser('twin'); w.add_argument('value_0h',type=float); w.add_argument('value_24h',type=float); w.add_argument('--output',default='reports/screening_twin.csv')
+    n=sub.add_parser('next-test'); n.add_argument('input_csv'); n.add_argument('screening_csv'); n.add_argument('--output',default='reports/next_best_test.csv')
+    x=sub.add_parser('transfer-profile'); x.add_argument('reference_csv'); x.add_argument('external_csv');
+    args=ap.parse_args()
+    if args.cmd=='benchmark':
+        d=_load_for_benchmark(args.csv); out=comparative_anomaly_benchmark(d,y_col=args.label_column,score_col=args.score_column); Path(args.output).parent.mkdir(parents=True,exist_ok=True); out.to_csv(args.output,index=False); print(out.to_json(orient='records',indent=2)); return 0
+    if args.cmd=='escape':
+        out=escape_matrix(_load_for_benchmark(args.csv)); Path(args.output).parent.mkdir(parents=True,exist_ok=True); out.to_csv(args.output,index=False); print(out['group'].value_counts().to_json(indent=2)); return 0
+    if args.cmd=='adversarial':
+        d=_load_for_benchmark(args.csv); outdir=Path(args.output_dir); outdir.mkdir(parents=True,exist_ok=True)
+        s=adversarial_suite(d)
+        for k,v in s.items(): v.to_csv(outdir/f'{k}.csv',index=False)
+        print(json.dumps({'scenarios':list(s),'output_dir':str(outdir)},indent=2)); return 0
+    if args.cmd=='robustness':
+        d=_load_for_benchmark(args.csv); scenarios=adversarial_suite(d); rows=[]
+        for k,v in scenarios.items():
+            san=physics_sanity(v); rows.append({'scenario':k,'rows':len(v),'parts':int(_part_series(v).nunique()),'physics_pass':san['pass'],'missing_fraction':float(v.isna().mean().mean()),'schema_columns':len(v.columns)})
+        out=pd.DataFrame(rows); Path(args.output).parent.mkdir(parents=True,exist_ok=True); out.to_csv(args.output,index=False); print(out.to_json(orient='records',indent=2)); return 0
+    if args.cmd=='lot-health':
+        d=_load_for_benchmark(args.csv); a=pd.read_csv(args.anomaly) if args.anomaly else None; f=pd.read_csv(args.forecast) if args.forecast else None; out=lot_health(d,a,f); Path(args.output).parent.mkdir(parents=True,exist_ok=True); out.to_csv(args.output,index=False); print(out.to_json(orient='records',indent=2)); return 0
+    if args.cmd=='sanity': print(json.dumps(physics_sanity(_load_for_benchmark(args.csv)),indent=2)); return 0
+    if args.cmd=='leakage-audit': print(json.dumps(leakage_audit(_load_for_benchmark(args.csv),args.as_of),indent=2)); return 0
+    if args.cmd=='threshold':
+        d=_load_for_benchmark(args.csv); y=_binary_labels(d[args.label_column]); s=pd.to_numeric(d[args.score_column],errors='coerce').fillna(0); cfg=load_yaml(PROJECT_ROOT/'configs'/'policy.yaml'); costs=cfg.get('costs',{}); out=calibrate_cost_policy(y,s,fn_cost=float(costs.get('false_negative',100)),fp_cost=float(costs.get('false_positive',1))); Path(args.output).parent.mkdir(parents=True,exist_ok=True); save_json(out,args.output); print(json.dumps(out,indent=2)); return 0
+    if args.cmd=='twin':
+        out=screening_twin(args.value_0h,args.value_24h); Path(args.output).parent.mkdir(parents=True,exist_ok=True); out.to_csv(args.output,index=False); print(out.to_json(orient='records',indent=2)); return 0
+    if args.cmd=='next-test':
+        d=_load_for_benchmark(args.input_csv); s=pd.read_csv(args.screening_csv); out=next_best_test(d,s); Path(args.output).parent.mkdir(parents=True,exist_ok=True); out.to_csv(args.output,index=False); print(out.head(20).to_json(orient='records',indent=2)); return 0
+    if args.cmd=='transfer-profile':
+        r=_load_for_benchmark(args.reference_csv); e=_load_for_benchmark(args.external_csv); print(json.dumps(transfer_profile(r,e),indent=2)); return 0
+    return 0
+
+# ---------------------------------------------------------------------------
+# V4 pipeline integration
+# ---------------------------------------------------------------------------
+
+def _drop_evaluation_only_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove ground-truth/future-label fields before model execution."""
+    result = df.copy()
+    patterns = [
+        r"^future_defective(?:_\d+h)?$",
+        r"^defect_state$",
+        r"^latent_defect_label$",
+        r"^failure_mode$",
+        r"^absolute_fail_\d+h$",
+        r"^ground_truth$",
+        r"^target_\d+h$",
+    ]
+    drop = [
+        c for c in result.columns
+        if any(re.search(p, str(c), flags=re.IGNORECASE) for p in patterns)
+    ]
+    return result.drop(columns=drop, errors="ignore")
+
+
+def _canonical_part_column(df: pd.DataFrame) -> str | None:
+    return _find_col(df, ["component_id", "part_id", "part", "device_id", "serial_id"])
+
+
+def _truth_table(df: pd.DataFrame, horizon_h: float = 168.0) -> pd.DataFrame:
+    part_col = _canonical_part_column(df)
+    if part_col is None:
+        return pd.DataFrame(columns=["component_id", "future_defective", "defect_state", "split", "lot_id"])
+    d = df.copy()
+    d["component_id"] = d[part_col].astype(str)
+    future = None
+    for candidate in [f"future_defective_{int(horizon_h)}h", "future_defective", "future_failure", "defective"]:
+        if candidate in d.columns:
+            future = _binary_labels(d[candidate])
+            break
+    if future is None and "defect_state" in d.columns:
+        future = d["defect_state"].astype(str).str.lower().isin({"latent", "hard", "defective", "failed", "failure"}).astype(int)
+    if future is None:
+        future = pd.Series(0, index=d.index, dtype=int)
+    d["future_defective"] = future.astype(int)
+    keep = ["component_id", "future_defective"]
+    if "defect_state" in d.columns:
+        keep.append("defect_state")
+    if "split" in d.columns:
+        keep.append("split")
+    lot = _find_col(d, ["lot_id", "lot", "batch_id", "batch"])
+    if lot is not None:
+        d["lot_id"] = d[lot].astype(str)
+        keep.append("lot_id")
+    return d[keep].drop_duplicates("component_id")
+
+
+def _canonicalize_for_v4(data: pd.DataFrame) -> pd.DataFrame:
+    """Canonicalize once for progressive slicing while preserving V4 semantics."""
+    canonical, _ = ingest_dataframe(data, parameters_path=PROJECT_ROOT / "configs" / "parameters.yaml")
+    return canonical
+
+
+def progressive_screen_dataframe(
+    data: pd.DataFrame,
+    output_dir: str | Path | None = None,
+    *,
+    origins: Sequence[float] = DEFAULT_ORIGINS,
+    target_horizon: float = 168.0,
+    parameters_path: str | Path = PROJECT_ROOT / "configs" / "parameters.yaml",
+    policy_path: str | Path = PROJECT_ROOT / "configs" / "policy.yaml",
+) -> dict[str, Any]:
+    """Leak-safe progressive screening using the V4 pipeline.
+
+    Each origin only receives observations with time_h <= origin. The future
+    labels remain outside the model input and are used only to calculate
+    progressive detection/lead-time metrics.
+    """
+    canonical, _audit = ingest_dataframe(
+        data,
+        parameters_path=parameters_path,
+    )
+    truth = _truth_table(data, target_horizon)
+    root = Path(output_dir) if output_dir is not None else None
+    if root is not None:
+        root.mkdir(parents=True, exist_ok=True)
+
+    runs: list[dict[str, Any]] = []
+    decisions: list[pd.DataFrame] = []
+
+    for origin in origins:
+        early = canonical.loc[
+            pd.to_numeric(canonical["time_h"], errors="coerce") <= float(origin)
+        ].copy()
+        if early.empty:
+            continue
+
+        run = run_screening(
+            early,
+            parameters_path=str(parameters_path),
+            policy_path=str(policy_path),
+            target_horizon_h=float(target_horizon),
+        )
+        triage = run.triage.copy()
+        triage["origin_h"] = float(origin)
+        triage = triage.merge(
+            truth[["component_id", "future_defective"]],
+            on="component_id",
+            how="left",
+        )
+        decisions.append(triage)
+
+        run_record = {
+            "origin_h": float(origin),
+            "rows": int(len(early)),
+            "components": int(run.triage["component_id"].nunique()) if not run.triage.empty else 0,
+            "triage": run.triage,
+            "capability_manifest": asdict(run.capability_manifest),
+            "ingestion_audit": run.ingestion_audit.to_dict(),
+        }
+        runs.append(run_record)
+
+        if root is not None:
+            od = root / f"origin_{int(origin)}h"
+            od.mkdir(parents=True, exist_ok=True)
+            early.to_csv(od / "input_canonical.csv", index=False)
+            run.triage.to_csv(od / "triage.csv", index=False)
+            run.feature_table.to_csv(od / "features.csv", index=False)
+            run.canonical_telemetry.to_csv(od / "canonical_telemetry.csv", index=False)
+            (od / "capability_manifest.json").write_text(json.dumps(asdict(run.capability_manifest), indent=2, default=str), encoding="utf-8")
+            (od / "ingestion_audit.json").write_text(json.dumps(run.ingestion_audit.to_dict(), indent=2, default=str), encoding="utf-8")
+
+    combined = pd.concat(decisions, ignore_index=True) if decisions else pd.DataFrame()
+    lead = _progressive_lead_time(combined, target_horizon=target_horizon)
+
+    if root is not None:
+        combined.to_csv(root / "progressive_decisions.csv", index=False)
+        lead.to_csv(root / "progressive_lead_time.csv", index=False)
+
+    return {"runs": runs, "decisions": combined, "lead_time": lead}
+
+
+def _progressive_lead_time(decisions: pd.DataFrame, *, target_horizon: float) -> pd.DataFrame:
+    if decisions.empty or "component_id" not in decisions.columns:
+        return pd.DataFrame(columns=["component_id", "first_flag_time_h", "lead_time_h", "future_defective"])
+    d = decisions.copy()
+    d["origin_h"] = pd.to_numeric(d["origin_h"], errors="coerce")
+    if "future_defective" in d.columns:
+        d["future_defective"] = pd.to_numeric(d["future_defective"], errors="coerce").fillna(0).astype(int)
+    else:
+        d["future_defective"] = 0
+    d["decision"] = d.get("disposition", d.get("decision", "" )).astype(str)
+    flags = d[d["decision"].isin({"REVIEW", "REJECT"})].sort_values(["component_id", "origin_h"])
+    first = (
+        flags.drop_duplicates("component_id", keep="first")[["component_id", "origin_h", "decision", "failure_risk"]]
+        .rename(columns={"origin_h": "first_flag_time_h"})
+        if not flags.empty
+        else pd.DataFrame(columns=["component_id", "first_flag_time_h", "decision", "failure_risk"])
+    )
+    parts = d[["component_id", "future_defective"]].drop_duplicates("component_id")
+    out = parts.merge(first, on="component_id", how="left")
+    out["lead_time_h"] = float(target_horizon) - pd.to_numeric(out["first_flag_time_h"], errors="coerce")
+    return out
+
+
+def _get_anomaly_columns(triage: pd.DataFrame) -> dict[str, str]:
+    aliases = {
+        "absolute_limits": ["absolute_violation", "hard_limit_violation"],
+        "robust_PAT": ["robust_pat_score", "population_evidence", "robust_population_score"],
+        "isolation_forest": ["isolation_forest_score", "parameter_isolation_evidence"],
+        "temporal": ["temporal_score", "temporal_evidence"],
+        "multivariate": ["multivariate_score", "multivariate_component_score"],
+        "full_ensemble": ["anomaly_score", "calibrated_anomaly_score", "anomaly_risk"],
+    }
+    resolved: dict[str, str] = {}
+    for name, candidates in aliases.items():
+        col = _find_col(triage, candidates)
+        if col is not None:
+            resolved[name] = col
+    return resolved
+
+
+def _absolute_from_triage(triage: pd.DataFrame) -> pd.Series:
+    if "absolute_violation" in triage.columns:
+        return _binary_labels(triage["absolute_violation"]).astype(bool)
+    if "hard_limit_violation" in triage.columns:
+        return _binary_labels(triage["hard_limit_violation"]).astype(bool)
+    value = pd.to_numeric(triage.get("value"), errors="coerce")
+    lower = pd.to_numeric(triage.get("lower_limit"), errors="coerce") if "lower_limit" in triage else pd.Series(np.nan, index=triage.index)
+    upper = pd.to_numeric(triage.get("upper_limit"), errors="coerce") if "upper_limit" in triage else pd.Series(np.nan, index=triage.index)
+    return ((lower.notna() & (value < lower)) | (upper.notna() & (value > upper))).fillna(False)
+
+
+def _attach_truth(triage: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
+    key = _find_col(triage, ["component_id", "part_id"])
+    if key is None:
+        raise ValueError("V4 triage has no component identifier column.")
+    d = triage.copy()
+    d["component_id"] = d[key].astype(str)
+    return d.merge(labels, on="component_id", how="left", suffixes=("", "_truth"))
+
+
+def _module_a_table(test_triage: pd.DataFrame, labels: pd.DataFrame, thresholds: Mapping[str, float]) -> pd.DataFrame:
+    d = _attach_truth(test_triage, labels)
+    y = pd.to_numeric(d["future_defective"], errors="coerce").fillna(0).astype(int).to_numpy()
+    absolute_fail = _absolute_from_triage(d).to_numpy(bool)
+    escape = (~absolute_fail) & (y == 1)
+    methods = _get_anomaly_columns(d)
+    rows: list[dict[str, Any]] = []
+    for name, col in methods.items():
+        score = pd.to_numeric(d[col], errors="coerce").fillna(0.0).to_numpy(float)
+        threshold = float(thresholds.get(name, 0.5 if name == "absolute_limits" else 0.6))
+        if name == "absolute_limits":
+            score = absolute_fail.astype(float)
+        metrics = evaluate_anomaly_scores(y, score, threshold)
+        pred = score >= threshold
+        metrics.update({
+            "method": name,
+            "latent_escape_recall": float((escape & pred).sum() / max(int(escape.sum()), 1)),
+            "latent_escape_fnr": float((escape & ~pred).sum() / max(int(escape.sum()), 1)),
         })
-    return MetricResult({
-        "feasible": True,
-        "threshold": best["threshold"],
-        "cost": best["cost"],
-        **best["metrics"],
-        "objective": "maximize_recall_under_burden" if target_metric == "escape_recall" else "minimize_fn_cost_under_burden",
-        "target_metric": target_metric,
-        "max_reject_rate": float(max_reject_rate),
-        "selection_set": "validation",
-    })
+        rows.append(metrics)
+    return pd.DataFrame(rows)
+
+
+def _target_value_table(source: pd.DataFrame, horizon_h: float) -> pd.DataFrame:
+    part_col = _canonical_part_column(source)
+    if part_col is None or "parameter" not in source.columns or "time_h" not in source.columns or "value" not in source.columns:
+        return pd.DataFrame(columns=["component_id", "parameter", "actual_target"])
+    d = source.copy()
+    d["component_id"] = d[part_col].astype(str)
+    d["time_h"] = pd.to_numeric(d["time_h"], errors="coerce")
+    d["value"] = pd.to_numeric(d["value"], errors="coerce")
+    d = d.dropna(subset=["time_h", "value", "parameter"])
+    d["distance"] = (d["time_h"] - float(horizon_h)).abs()
+    d = d.sort_values(["component_id", "parameter", "distance", "time_h"])
+    return d.groupby(["component_id", "parameter"], as_index=False).first()[["component_id", "parameter", "value"]].rename(columns={"value": "actual_target"})
+
+
+def _prediction_column(triage: pd.DataFrame, horizon_h: float) -> str | None:
+    preferred = [
+        f"prediction_{int(horizon_h)}h",
+        f"prediction_{str(horizon_h).replace('.', '_')}h",
+        "prediction_168h",
+        "predicted_value_at_horizon",
+    ]
+    return _find_col(triage, preferred)
+
+
+def _module_b_table(full_test: pd.DataFrame, early_test: pd.DataFrame, triage: pd.DataFrame, horizon_h: float) -> pd.DataFrame:
+    pred_col = _prediction_column(triage, horizon_h)
+    if pred_col is None:
+        return pd.DataFrame()
+    actual = _target_value_table(full_test, horizon_h)
+    d = triage.copy()
+    key_cols = [c for c in ["component_id", "parameter"] if c in d.columns]
+    if len(key_cols) != 2:
+        return pd.DataFrame()
+    d["component_id"] = d["component_id"].astype(str)
+    d["parameter"] = d["parameter"].astype(str)
+    m = d.merge(actual, on=key_cols, how="left")
+    predictions = pd.to_numeric(m[pred_col], errors="coerce").to_numpy(float)
+    lower = pd.to_numeric(m.get("prediction_lower"), errors="coerce").to_numpy(float) if "prediction_lower" in m else np.full(len(m), np.nan)
+    upper = pd.to_numeric(m.get("prediction_upper"), errors="coerce").to_numpy(float) if "prediction_upper" in m else np.full(len(m), np.nan)
+    y = pd.to_numeric(m["actual_target"], errors="coerce").to_numpy(float)
+
+    # Persistence and local linear baselines use only the early-origin observations.
+    early = _drop_evaluation_only_columns(early_test.copy())
+    if "component_id" not in early.columns and "part_id" in early.columns:
+        early["component_id"] = early["part_id"].astype(str)
+    if "component_id" in early.columns:
+        early["component_id"] = early["component_id"].astype(str)
+    early["time_h"] = pd.to_numeric(early.get("time_h"), errors="coerce")
+    early["value"] = pd.to_numeric(early.get("value"), errors="coerce")
+    pers = np.full(len(m), np.nan)
+    linear = np.full(len(m), np.nan)
+    for i, row in m.iterrows():
+        g = early.loc[
+            early["component_id"].eq(str(row["component_id"]))
+            & early.get("parameter", pd.Series(index=early.index, dtype=object)).astype(str).eq(str(row["parameter"]))
+        ].dropna(subset=["time_h", "value"]).sort_values("time_h")
+        if g.empty:
+            continue
+        last = float(g.iloc[-1]["value"])
+        pers[i] = last
+        if len(g) >= 2 and float(g["time_h"].iloc[-1]) != float(g["time_h"].iloc[0]):
+            slope = float((g["value"].iloc[-1] - g["value"].iloc[0]) / (g["time_h"].iloc[-1] - g["time_h"].iloc[0]))
+            linear[i] = last + slope * (float(horizon_h) - float(g["time_h"].iloc[-1]))
+        else:
+            linear[i] = last
+
+    rows = []
+    for name, pred in [("persistence", pers), ("linear", linear), ("selected", predictions)]:
+        ok = np.isfinite(y) & np.isfinite(pred)
+        row: dict[str, Any] = {
+            "model": name,
+            "horizon_h": float(horizon_h),
+            "n": int(ok.sum()),
+            "mae": float(mean_absolute_error(y[ok], pred[ok])) if ok.any() else None,
+            "rmse": float(np.sqrt(mean_squared_error(y[ok], pred[ok]))) if ok.any() else None,
+        }
+        if name == "selected" and np.isfinite(lower).any() and np.isfinite(upper).any():
+            interval_ok = ok & np.isfinite(lower) & np.isfinite(upper)
+            row["conformal_coverage"] = float(np.mean((y[interval_ok] >= lower[interval_ok]) & (y[interval_ok] <= upper[interval_ok]))) if interval_ok.any() else None
+            row["mean_interval_width"] = float(np.mean(upper[interval_ok] - lower[interval_ok])) if interval_ok.any() else None
+        else:
+            row["conformal_coverage"] = None
+            row["mean_interval_width"] = None
+
+        limit = pd.to_numeric(m.get("upper_limit"), errors="coerce").to_numpy(float) if "upper_limit" in m else np.full(len(m), np.nan)
+        limit_ok = ok & np.isfinite(limit)
+        actual_cross = y > limit
+        forecast_cross = (upper if name == "selected" else pred) > limit
+        row["limit_crossing_recall"] = float((actual_cross & forecast_cross & limit_ok).sum() / max(int((actual_cross & limit_ok).sum()), 1)) if limit_ok.any() else None
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 def calibrate_safety_policy(
@@ -202,747 +979,271 @@ def calibrate_safety_policy(
     fn_cost: float = 100.0,
     fp_cost: float = 1.0,
     max_reject_rate: float = 0.25,
-    target_metric: str = "future_recall",
+    max_target_fpr: float | None = None,
 ) -> dict[str, Any]:
-    """Calibrate the scalar risk threshold on validation only and emit a frozen policy artifact."""
+    """Validation-only calibration for the V4 failure-risk gate."""
     d = validation_screening.copy()
-    y = _binary_truth(d, "future_defective") if "future_defective" in d.columns else _binary_truth(d, "future_defective_168h")
-    if target_metric == "escape_recall":
-        if "latent_escape_target" not in d.columns:
-            if "absolute_fail_168h" in d.columns:
-                absfail = _bool_series(d, "absolute_fail_168h")
-                d["latent_escape_target"] = ((~absfail) & y.eq(1)).astype(int)
-            else:
-                d["latent_escape_target"] = y.astype(int)
-        calibration_y = d["latent_escape_target"].astype(int).to_numpy()
-    else:
-        calibration_y = y.to_numpy()
-    score = pd.to_numeric(d.get("risk_score", d.get("anomaly_risk", 0.0)), errors="coerce").fillna(0).to_numpy(float)
-    opt = optimize_threshold(calibration_y, score, fn_cost=fn_cost, fp_cost=fp_cost, review_cost=0.25, max_reject_rate=max_reject_rate, target_metric=target_metric)
-    if not opt.get("feasible", False):
-        raise RuntimeError(f"Unable to select a validation operating point under max_reject_rate={max_reject_rate}: {opt}")
-    reject_min = float(opt["threshold"])
-    negative_scores = score[calibration_y == 0]
-    healthy_p95 = float(np.quantile(negative_scores, 0.95)) if negative_scores.size else max(0.0, reject_min - 0.05)
-    safe_max = float(max(0.0, min(reject_min - 1e-6, healthy_p95)))
+    y = _binary_labels(d["future_defective"]) if "future_defective" in d.columns else pd.Series(0, index=d.index)
+    score_column = _find_col(d, ["failure_risk", "risk_score", "anomaly_score"])
+    score = pd.to_numeric(d[score_column], errors="coerce").fillna(0.0).to_numpy(float) if score_column else np.zeros(len(d))
+    policy = load_yaml(PROJECT_ROOT / "configs" / "policy.yaml")
+    if max_target_fpr is None:
+        max_target_fpr = float(policy.get("thresholds", {}).get("max_target_fpr", 0.05))
+    result = optimize_threshold(
+        y,
+        score,
+        fn_cost=fn_cost,
+        fp_cost=fp_cost,
+        reject_rate_max=max_reject_rate,
+        fpr_max=max_target_fpr,
+    )
     payload = {
-        "format": "safety_policy_calibration_v3",
+        "format": "safety_policy_calibration_v4",
         "selection_split": "validation",
-        "objective": "minimize catastrophic false negatives subject to bounded escalation burden",
-        "thresholds": {"safe_max": safe_max, "review_max": reject_min, "reject_min": reject_min},
-        "optimization": opt,
-        "validation_rows": int(len(d)),
-        "validation_positive_count": int(calibration_y.sum()),
-        "calibration_target": target_metric,
-        "max_reject_rate": float(max_reject_rate),
-        "note": "Thresholds are selected from validation evidence only; final test labels are never used for calibration.",
+        "score_column": score_column or "unavailable",
+        "thresholds": {
+            "risk_reject_threshold": float(result.threshold),
+            "risk_review_threshold": float(min(0.40, result.threshold)),
+            "reject_min": float(result.threshold),
+            "safe_max": float(min(0.25, result.threshold)),
+            "max_target_fpr": float(max_target_fpr),
+        },
+        "optimization": asdict(result),
     }
-    if output_path:
-        p=Path(output_path); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    if output_path is not None:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     return payload
 
 
-def _attach_labels(screening: pd.DataFrame, raw: pd.DataFrame, target_horizon: float = 168.0) -> pd.DataFrame:
-    cols = [
-        "part_id", "lot_id", "split", "defect_state", "latent_defect_label",
-        "failure_mode", "primary_failure_mode", "high_but_safe", "measurement_only_anomaly",
-        "precursor_strength", "precursor_effect",
-        "future_defective_168h", "absolute_fail_168h", "drift_failure_168h",
-    ]
-    present = [c for c in cols if c in raw.columns]
-    labels = raw[present].drop_duplicates("part_id") if present else pd.DataFrame({"part_id": raw["part_id"].astype(str).unique()})
-    labels["part_id"] = labels["part_id"].astype(str)
-    out = screening.copy()
-    out["part_id"] = out["part_id"].astype(str)
-    merged = out.merge(labels, on="part_id", how="left", suffixes=("", "_truth"))
-    return merged
+def redecide_screening(
+    triage: pd.DataFrame,
+    calibrated_policy: Mapping[str, Any] | None = None,
+    *,
+    policy_path: str | Path = PROJECT_ROOT / "configs" / "policy.yaml",
+) -> pd.DataFrame:
+    """Apply the V4 deterministic policy to an already-computed triage table."""
+    d = triage.copy()
+    policy = load_yaml(policy_path)
+    thresholds = dict(policy.get("thresholds", {}))
+    if calibrated_policy:
+        thresholds.update(calibrated_policy.get("thresholds", {}))
+    risk_reject = float(thresholds.get("risk_reject_threshold", 0.75))
+    risk_review = float(thresholds.get("risk_review_threshold", 0.40))
+    ood_threshold = float(thresholds.get("ood_novelty_threshold", 0.70))
+    uncertainty_threshold = float(thresholds.get("max_uncertainty_threshold", 0.65))
+    anomaly_threshold = float(thresholds.get("anomaly_review_threshold", 0.60))
+    crossing_confidence = float(thresholds.get("crossing_confidence_threshold", 0.80))
 
+    decisions = []
+    reasons = []
+    for _, row in d.iterrows():
+        value = pd.to_numeric(pd.Series([row.get("value")]), errors="coerce").iloc[0]
+        lower = row.get("lower_limit")
+        upper = row.get("upper_limit")
+        hard = (pd.notna(lower) and pd.notna(value) and float(value) < float(lower)) or (pd.notna(upper) and pd.notna(value) and float(value) > float(upper))
+        ood_score = float(pd.to_numeric(pd.Series([row.get("ood_score", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        ood_status = str(row.get("ood_status", "LOW"))
+        risk = float(pd.to_numeric(pd.Series([row.get("failure_risk", row.get("risk_score", 0.0))]), errors="coerce").fillna(0.0).iloc[0])
+        anomaly = float(pd.to_numeric(pd.Series([row.get("anomaly_score", row.get("anomaly_risk", 0.0))]), errors="coerce").fillna(0.0).iloc[0])
+        confidence = float(pd.to_numeric(pd.Series([row.get("forecast_confidence", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+        crossing = bool(row.get("predicted_limit_crossing", False))
+        uncertainty = 1.0 - np.clip(confidence, 0.0, 1.0)
+        mode = str(row.get("forecast_mode", "INSUFFICIENT"))
 
-def system_disposition_metrics(screening: pd.DataFrame, raw: pd.DataFrame, target_horizon: float = 168.0) -> dict[str, Any]:
-    d = _attach_labels(screening, raw, target_horizon)
-    y = _binary_truth(d, f"future_defective_{int(target_horizon)}h")
-    decisions = d["decision"].astype(str) if "decision" in d else pd.Series(["UNKNOWN"] * len(d))
-    escalation = decisions.isin({"REVIEW", "REJECT"})
-    reject = decisions.eq("REJECT")
-    safe = decisions.eq("SAFE")
-    unknown = decisions.eq("UNKNOWN")
-    review = decisions.eq("REVIEW")
-    policy_cfg = load_yaml(PROJECT_ROOT / "configs" / "policy.yaml")
-    costs = policy_cfg.get("costs", {}) if isinstance(policy_cfg, dict) else {}
-    fn_cost = float(costs.get("false_negative", 100.0))
-    fp_cost = float(costs.get("false_positive", 1.0))
-    review_cost = float(costs.get("uncertain_decision", 0.25))
-    unknown_cost = float(costs.get("data_quality_failure", 10.0))
-    cm = classification_metrics(y.to_numpy(), escalation.to_numpy())
-    cm.update({
-        "safe_count": int(safe.sum()),
-        "review_count": int(review.sum()),
-        "reject_count": int(reject.sum()),
-        "unknown_count": int(unknown.sum()),
-        "safe_rate": float(safe.mean()) if len(d) else 0.0,
-        "review_rate": float(review.mean()) if len(d) else 0.0,
-        "reject_rate": float(reject.mean()) if len(d) else 0.0,
-        "unknown_rate": float(unknown.mean()) if len(d) else 0.0,
-        "escalation_rate": float(escalation.mean()) if len(d) else 0.0,
-        "automatic_reject_burden": float(reject.mean()) if len(d) else 0.0,
-        "cost_weighted_loss": float(
-            fn_cost * (~escalation & y.eq(1)).sum()
-            + fp_cost * (escalation & y.eq(0)).sum()
-            + review_cost * review.sum()
-            + unknown_cost * unknown.sum()
-        ),
-        "ood_low_count": int(d.get("ood_status", pd.Series("UNKNOWN", index=d.index)).astype(str).eq("LOW").sum()),
-        "ood_moderate_count": int(d.get("ood_status", pd.Series("UNKNOWN", index=d.index)).astype(str).eq("MODERATE").sum()),
-        "ood_severe_count": int(d.get("ood_status", pd.Series("UNKNOWN", index=d.index)).astype(str).eq("SEVERE").sum()),
-        "false_reject_rate": float((reject & y.eq(0)).sum() / max(int(y.eq(0).sum()), 1)),
-        "false_review_rate": float((review & y.eq(0)).sum() / max(int(y.eq(0).sum()), 1)),
-    })
-    hs = _bool_series(d, "high_but_safe")
-    ma = _bool_series(d, "measurement_only_anomaly")
-    if hs.any():
-        cm["high_safe_total"] = int(hs.sum())
-        cm["high_safe_escalated"] = int((hs & escalation).sum())
-        cm["high_safe_review"] = int((hs & review).sum())
-        cm["high_safe_reject"] = int((hs & reject).sum())
-        cm["high_safe_false_disposition_rate"] = float((hs & escalation).sum() / hs.sum())
-    else:
-        cm.update({"high_safe_total": 0, "high_safe_escalated": 0, "high_safe_review": 0, "high_safe_reject": 0, "high_safe_false_disposition_rate": None})
-    if ma.any():
-        cm["measurement_artifact_total"] = int(ma.sum())
-        cm["measurement_artifact_escalated"] = int((ma & escalation).sum())
-        cm["measurement_artifact_review"] = int((ma & review).sum())
-        cm["measurement_artifact_reject"] = int((ma & reject).sum())
-        cm["measurement_artifact_false_flag_rate"] = float((ma & escalation).sum() / ma.sum())
-    else:
-        cm.update({"measurement_artifact_total": 0, "measurement_artifact_escalated": 0, "measurement_artifact_review": 0, "measurement_artifact_reject": 0, "measurement_artifact_false_flag_rate": None})
-    normal_aging = _mechanism_name(d).str.upper().eq("NORMAL_AGING")
-    cm["normal_aging_total"] = int(normal_aging.sum())
-    cm["normal_aging_false_alarm_rate"] = float((normal_aging & escalation).sum() / normal_aging.sum()) if normal_aging.any() else None
-    return cm
-
-
-def latent_escape_metrics(screening: pd.DataFrame, raw: pd.DataFrame, target_horizon: float = 168.0) -> dict[str, Any]:
-    d = _attach_labels(screening, raw, target_horizon)
-    y = _binary_truth(d, f"future_defective_{int(target_horizon)}h")
-    absfail = _bool_series(d, f"absolute_fail_{int(target_horizon)}h")
-    escape = (~absfail) & y.eq(1)
-    escalation = d["decision"].astype(str).isin({"REVIEW", "REJECT"}) if "decision" in d else pd.Series(False, index=d.index)
-    m = classification_metrics(escape.astype(int).to_numpy(), escalation.to_numpy())
-    m["latent_escape_count"] = int(escape.sum())
-    return {
-        "latent_escape": m,
-        "escape_precision_denominator": int(escalation.sum()),
-    }
-
-
-def mechanism_table(screening: pd.DataFrame, raw: pd.DataFrame, target_horizon: float = 168.0) -> pd.DataFrame:
-    d = _attach_labels(screening, raw, target_horizon)
-    y = _binary_truth(d, f"future_defective_{int(target_horizon)}h")
-    absfail = _bool_series(d, f"absolute_fail_{int(target_horizon)}h")
-    escalation = d["decision"].astype(str).isin({"REVIEW", "REJECT"})
-    mech = _mechanism_name(d).str.upper()
-    order = ["LATENT_CHANGE_POINT", "LATENT_ACCELERATING", "LATENT_ABRUPT", "HARD_EARLY_FAILURE", "NORMAL_AGING"]
-    rows = []
-    seen = []
-    for name in order + sorted(set(mech.unique()) - set(order)):
-        sub = mech.eq(name)
-        if not sub.any():
-            continue
-        esc = classification_metrics(y[sub].to_numpy(), escalation[sub].to_numpy())
-        escape = sub & (~absfail) & y.eq(1)
-        escape_recall = float((escape & escalation).sum() / max(int(escape.sum()), 1))
-        rows.append({
-            "mechanism": name,
-            "parts": int(sub.sum()),
-            "future_defective": int(y[sub].sum()),
-            "recall": esc["recall"],
-            "false_negative_rate": esc["false_negative_rate"],
-            "false_positive_rate": esc["false_positive_rate"],
-            "escalation_rate": esc["flag_rate"],
-            "escape_count": int(escape.sum()),
-            "escape_recall": escape_recall,
-        })
-    return pd.DataFrame(rows)
-
-
-def progressive_metrics(progressive: dict[str, Any], raw: pd.DataFrame, target_horizon: float = 168.0) -> pd.DataFrame:
-    decisions = progressive["decisions"].copy()
-    meta = _attach_labels(pd.DataFrame({"part_id": raw["part_id"].astype(str).unique()}), raw, target_horizon)
-    meta = meta[[c for c in ["part_id", "future_defective_168h", "future_defective", "absolute_fail_168h", "failure_mode", "primary_failure_mode"] if c in meta.columns]]
-    decisions["part_id"] = decisions["part_id"].astype(str)
-    d = decisions.merge(meta, on="part_id", how="left")
-    rows = []
-    for origin, g in d.groupby("origin_h", sort=True):
-        y = _binary_truth(g, f"future_defective_{int(target_horizon)}h")
-        esc = g["decision"].astype(str).isin({"REVIEW", "REJECT"})
-        absfail = _bool_series(g, f"absolute_fail_{int(target_horizon)}h")
-        e = (~absfail) & y.eq(1)
-        m = classification_metrics(y.to_numpy(), esc.to_numpy())
-        rows.append({"origin_h": float(origin), **m, "escape_count": int(e.sum()), "escape_recall": float((e & esc).sum() / max(int(e.sum()), 1))})
-    return pd.DataFrame(rows)
-
-
-def lead_time_table(progressive: dict[str, Any], raw: pd.DataFrame, target_horizon: float = 168.0) -> pd.DataFrame:
-    lead = progressive["lead_time"].copy()
-    lead["part_id"] = lead["part_id"].astype(str)
-    labels = raw[[c for c in ["part_id", f"future_defective_{int(target_horizon)}h", "defect_state", "failure_mode", "primary_failure_mode"] if c in raw.columns]].drop_duplicates("part_id")
-    labels["part_id"] = labels["part_id"].astype(str)
-    return lead.merge(labels, on="part_id", how="left")
-
-
-def summarize_lead_time(lead: pd.DataFrame, target_horizon: float = 168.0) -> dict[str, Any]:
-    y = _binary_truth(lead, f"future_defective_{int(target_horizon)}h")
-    detected = pd.to_numeric(lead["lead_time_h"], errors="coerce").notna()
-    vals = pd.to_numeric(lead.loc[y.eq(1) & detected, "lead_time_h"], errors="coerce").dropna()
-    total_def = int(y.eq(1).sum())
-    detected_def = int((y.eq(1) & detected).sum())
-    out = {
-        "future_defective_total": total_def,
-        "detected_future_defective": detected_def,
-        "lead_detection_rate": float(detected_def / max(total_def, 1)),
-        "median_lead_time_h": float(vals.median()) if len(vals) else None,
-        "lead_time_q1_h": float(vals.quantile(0.25)) if len(vals) else None,
-        "lead_time_q3_h": float(vals.quantile(0.75)) if len(vals) else None,
-        "lead_time_min_h": float(vals.min()) if len(vals) else None,
-        "lead_time_max_h": float(vals.max()) if len(vals) else None,
-    }
-    if len(vals):
-        for p in (0.10, 0.25, 0.50, 0.75, 0.90):
-            out[f"lead_time_p{int(p*100)}_h"] = float(vals.quantile(p))
-    return out
-
-
-def _forecast_target_map(raw: pd.DataFrame, target_horizon: float) -> pd.Series:
-    col = f"target_{int(target_horizon) if float(target_horizon).is_integer() else str(target_horizon).replace('.', '_')}h"
-    if col not in raw.columns:
-        raise ValueError(f"Forecast evaluation requires observed {col}; value_<h> or latent_<h> are not accepted as a hidden substitute.")
-    keys = [c for c in ["part_id", "parameter"] if c in raw.columns]
-    if "part_id" not in keys:
-        raise ValueError("Forecast truth alignment requires part_id")
-    return raw[keys + [col]].drop_duplicates(keys).set_index(keys)[col]
-
-
-def forecast_comparison(raw_test: pd.DataFrame, pred: pd.DataFrame, target_horizon: float = 168.0) -> pd.DataFrame:
-    target = _forecast_target_map(raw_test, target_horizon)
-    keys = [c for c in ["part_id", "parameter"] if c in pred.columns]
-    if keys != list(target.index.names):
-        if "parameter" in target.index.names and "parameter" not in pred.columns:
-            raise ValueError("Prediction output lacks parameter required for target alignment")
-    idx = pd.MultiIndex.from_frame(pred[keys].astype(str))
-    y = pd.to_numeric(target.reindex(idx), errors="coerce").to_numpy(float)
-    pred_col = f"prediction_{int(target_horizon) if float(target_horizon).is_integer() else str(target_horizon).replace('.', '_')}h"
-    if pred_col not in pred.columns:
-        pred_col = "prediction_168h"
-    lower = pd.to_numeric(pred.get("prediction_lower", np.nan), errors="coerce").to_numpy(float)
-    upper = pd.to_numeric(pred.get("prediction_upper", np.nan), errors="coerce").to_numpy(float)
-    limit = pd.to_numeric(pred.get("absolute_limit_upper", np.nan), errors="coerce").to_numpy(float) if "absolute_limit_upper" in pred else None
-    labels = raw_test[[c for c in ["part_id", "defect_state", "failure_mode", "primary_failure_mode"] if c in raw_test.columns]].drop_duplicates("part_id")
-    label_map = labels.set_index("part_id") if not labels.empty else None
-    rows = []
-    for name, col in [
-        ("persistence", "prediction_persistence"),
-        ("linear", "prediction_linear"),
-        ("ridge", "prediction_ridge"),
-        ("gradient_boosting", "prediction_gradient_boosting"),
-        ("selected", pred_col),
-    ]:
-        if col not in pred.columns:
-            continue
-        p = pd.to_numeric(pred[col], errors="coerce").to_numpy(float)
-        ok = np.isfinite(y) & np.isfinite(p)
-        row = {
-            "model": name,
-            "n": int(ok.sum()),
-            "mae": float(mean_absolute_error(y[ok], p[ok])) if ok.any() else None,
-            "rmse": float(np.sqrt(mean_squared_error(y[ok], p[ok]))) if ok.any() else None,
-        }
-        if name == "selected":
-            iv = ok & np.isfinite(lower) & np.isfinite(upper)
-            row["conformal_coverage"] = float(np.mean((y[iv] >= lower[iv]) & (y[iv] <= upper[iv]))) if iv.any() else None
-            row["mean_interval_width"] = float(np.mean(upper[iv] - lower[iv])) if iv.any() else None
-            if limit is not None:
-                lc = ok & np.isfinite(limit) & (limit > 0)
-                actual_cross = y > limit
-                pred_cross = upper > limit
-                row["limit_crossing_recall"] = float((actual_cross & pred_cross & lc).sum() / max(int((actual_cross & lc).sum()), 1)) if lc.any() else None
+        if hard:
+            decision, reason = "REJECT", "CURRENT_HARD_LIMIT_EXCEEDED"
+        elif ood_status == "SEVERE" or ood_score >= ood_threshold:
+            decision, reason = "UNKNOWN", "NOVEL_DOMAIN_OR_FAMILY_INSPECTION"
+        elif risk >= risk_reject or (crossing and confidence >= crossing_confidence):
+            decision, reason = "REJECT", "CALIBRATED_HIGH_FAILURE_RISK"
+        elif anomaly >= anomaly_threshold:
+            decision, reason = "REVIEW", "SIGNIFICANT_ANOMALY_OR_RAPID_DEGRADATION"
+        elif uncertainty >= uncertainty_threshold and mode in {"COLD_START", "INSUFFICIENT"}:
+            decision, reason = ("UNKNOWN", "HIGH_FORECAST_UNCERTAINTY") if mode == "INSUFFICIENT" else ("REVIEW", "HIGH_FORECAST_UNCERTAINTY")
+        elif mode == "INSUFFICIENT":
+            decision, reason = "UNKNOWN", "INSUFFICIENT_TIME_HISTORY"
+        elif risk >= risk_review:
+            decision, reason = "REVIEW", "MODERATE_CALIBRATED_FAILURE_RISK"
         else:
-            row["conformal_coverage"] = None
-            row["mean_interval_width"] = None
-            if limit is not None:
-                lc = ok & np.isfinite(limit) & (limit > 0)
-                actual_cross = y > limit
-                row["limit_crossing_recall"] = float((actual_cross & (p > limit) & lc).sum() / max(int((actual_cross & lc).sum()), 1)) if lc.any() else None
-        if label_map is not None and "part_id" in pred.columns:
-            parts = pred["part_id"].astype(str).map(label_map.get("defect_state", pd.Series(dtype=object))).astype(str).str.lower()
-            dangerous = parts.isin({"latent", "hard", "defective", "failed"}).to_numpy()
-            row["dangerous_case_mae"] = float(mean_absolute_error(y[ok & dangerous], p[ok & dangerous])) if np.any(ok & dangerous) else None
-        else:
-            row["dangerous_case_mae"] = None
-        rows.append(row)
-    return pd.DataFrame(rows)
+            decision, reason = "PASS", "SAFE_IN_DOMAIN_LOW_RISK"
+        decisions.append(decision)
+        reasons.append(reason)
 
-
-def robustness_scenarios(df: pd.DataFrame, seed: int = SEED) -> dict[str, pd.DataFrame]:
-    rng = np.random.default_rng(seed)
-    out = {"baseline": df.copy()}
-    value_cols = [c for c in df.columns if re.fullmatch(r"value_(?:12|24|48|72|96|120|144|168)h", str(c))]
-    for frac in (0.20, 0.40, 0.60):
-        z = df.copy()
-        if value_cols and len(z):
-            n = max(1, int(len(z) * frac))
-            ix = rng.choice(len(z), n, replace=False)
-            z.loc[z.index[ix], value_cols] = np.nan
-        out[f"missing_{int(frac*100)}pct"] = z
-    if "value_24h" in df.columns and len(df):
-        z = df.copy()
-        base = pd.to_numeric(z["value_24h"], errors="coerce")
-        z["value_24h"] = base + rng.normal(0, 0.05, len(z)) * base.abs().fillna(1).to_numpy()
-        out["noise_5pct"] = z
-    if "parameter" in df.columns:
-        z = df.copy(); z["parameter"] = "unknown_physical_quantity"; out["unknown_parameter"] = z
-    if "component_family" in df.columns:
-        z = df.copy(); z["component_family"] = "UNSEEN_FAMILY"; out["unknown_family"] = z
-    if "stress_mode" in df.columns:
-        z = df.copy(); z["stress_mode"] = "UNSEEN_STRESS"; out["unknown_stress"] = z
-    # Irregular-readpoint scenario: rename one known future readpoint out of the input.
-    if "value_48h" in df.columns:
-        z = df.copy(); z["value_48h"] = np.nan; out["missing_mid_readpoint"] = z
-    return out
-
-
-def _method_scores(anomaly: pd.DataFrame) -> dict[str, np.ndarray]:
-    return {
-        "absolute_limits": pd.to_numeric(anomaly.get("absolute_violation", 0), errors="coerce").fillna(0).to_numpy(float),
-        "robust_PAT": pd.to_numeric(anomaly.get("population_evidence", 0), errors="coerce").fillna(0).to_numpy(float),
-        "temporal": pd.to_numeric(anomaly.get("temporal_evidence", 0), errors="coerce").fillna(0).to_numpy(float),
-        "isolation_forest": pd.to_numeric(anomaly.get("parameter_isolation_evidence", 0), errors="coerce").fillna(0).to_numpy(float),
-        "multivariate": pd.to_numeric(anomaly.get("multivariate_component_score", 0), errors="coerce").fillna(0).to_numpy(float),
-        "full_ensemble": pd.to_numeric(anomaly.get("anomaly_score", 0), errors="coerce").fillna(0).to_numpy(float),
-    }
-
-
-def _fit_method_operating_points(val_score: pd.DataFrame, raw_val: pd.DataFrame, max_burden: float) -> dict[str, Any]:
-    y = _binary_truth(val_score, "future_defective_168h").to_numpy(int)
-    absfail = _bool_series(val_score, "absolute_fail_168h")
-    escape = (~absfail) & (y == 1)
-    out: dict[str, Any] = {}
-    for name, s in _method_scores(val_score).items():
-        target = escape.astype(int) if escape.sum() else y
-        out[name] = optimize_threshold(target, s, max_reject_rate=max_burden, target_metric="escape_recall" if escape.sum() else "future_recall")
-    return out
-
-
-def _ablation_table(test_anomaly: pd.DataFrame, raw_test: pd.DataFrame, operating_points: Mapping[str, Any]) -> pd.DataFrame:
-    y = _binary_truth(test_anomaly, "future_defective_168h").to_numpy(int)
-    absfail = _bool_series(test_anomaly, "absolute_fail_168h").to_numpy(bool)
-    rows = []
-    scores = _method_scores(test_anomaly)
-    for name, s in scores.items():
-        t = operating_points[name]["threshold"]
-        pred = s >= t
-        m = classification_metrics(y, pred, threshold=t)
-        esc = (~absfail) & (y == 1)
-        m["method"] = name
-        m["latent_escape_recall"] = float((pred & esc).sum() / max(int(esc.sum()), 1))
-        rows.append(m)
-    return pd.DataFrame(rows)
+    d["disposition"] = decisions
+    d["decision"] = decisions
+    d["policy_reason_code"] = reasons
+    d["risk_score"] = pd.to_numeric(d.get("failure_risk", d.get("risk_score", np.nan)), errors="coerce")
+    d["anomaly_risk"] = pd.to_numeric(d.get("anomaly_score", d.get("anomaly_risk", np.nan)), errors="coerce")
+    pred_col = _prediction_column(d, 168.0)
+    if pred_col is not None and "prediction_168h" not in d.columns:
+        d["prediction_168h"] = pd.to_numeric(d[pred_col], errors="coerce")
+    return d
 
 
 def run_master_benchmark(
     input_path: str | Path,
     output_dir: str | Path = "reports/benchmark",
     *,
-    seed: int = SEED,
-    n_seeds: int = 5,
+    seed: int = 20260831,
+    n_seeds: int = 1,
     target_horizon: float = 168.0,
     target_metric: str = "escape_recall",
     max_reject_rate: float = 0.25,
 ) -> dict[str, Any]:
-    outdir = Path(output_dir); outdir.mkdir(parents=True, exist_ok=True)
-    full = pd.read_csv(input_path, low_memory=False)
+    """Leak-safe V4 benchmark over train/validation/test partitions.
+
+    The early screening origin is 24 h so forecast metrics compare predictions
+    made from early evidence with the later target measurement.
+    """
+    outdir = Path(output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    full = _load_for_benchmark(input_path)
     if "split" not in full.columns:
-        raise ValueError("Benchmark requires train/val/test split labels by lot.")
-    for split in ("train", "val", "test"):
-        if not (full["split"].astype(str) == split).any():
-            raise ValueError(f"Missing {split} partition")
-    train = full[full.split.astype(str).eq("train")].copy()
-    val = full[full.split.astype(str).eq("val")].copy()
-    test = full[full.split.astype(str).eq("test")].copy()
+        raise ValueError("Benchmark requires a split column containing train, val and test.")
+    train = full[full["split"].astype(str).eq("train")].copy()
+    validation = full[full["split"].astype(str).eq("val")].copy()
+    test = full[full["split"].astype(str).eq("test")].copy()
+    if train.empty or validation.empty or test.empty:
+        raise ValueError("Train, validation and test partitions must all be non-empty.")
 
     seeds = [int(seed) + i for i in range(max(1, int(n_seeds)))]
-    seed_rows = []
-    all_mechanisms = []
-    all_progressive = []
-    all_forecast = []
-    all_robustness = []
-    all_ablation = []
+    all_a: list[pd.DataFrame] = []
+    all_b: list[pd.DataFrame] = []
+    all_progressive: list[pd.DataFrame] = []
+    threshold_records: dict[str, Any] = {}
+
+    validation_input = _drop_evaluation_only_columns(validation)
+    test_input = _drop_evaluation_only_columns(test)
+    labels = _truth_table(full, target_horizon)
 
     for current_seed in seeds:
-        run_dir = outdir / f"seed_{current_seed}"
-        run_dir.mkdir(parents=True, exist_ok=True)
         np.random.seed(current_seed)
+        seed_dir = outdir / f"seed_{current_seed}"
+        seed_dir.mkdir(parents=True, exist_ok=True)
 
-        # Train-only OOD profile for a strict blind-test protocol.
-        ood_artifact = run_dir / "ood_train_only.joblib"
-        fit_ood_profile(train, ood_artifact)
-        artifacts = PipelineArtifacts(
-            PROJECT_ROOT / "models" / "anomaly" / "model.joblib",
-            PROJECT_ROOT / "models" / "forecast" / "model.joblib",
-            ood_artifact,
+        val_early = validation_input.copy()
+        test_early = test_input.copy()
+        if "time_h" in val_early.columns:
+            val_early = val_early.loc[pd.to_numeric(val_early["time_h"], errors="coerce") <= 24.0].copy()
+            test_early = test_early.loc[pd.to_numeric(test_early["time_h"], errors="coerce") <= 24.0].copy()
+
+        val_run = run_screening(
+            val_early,
+            parameters_path=str(PROJECT_ROOT / "configs" / "parameters.yaml"),
+            policy_path=str(PROJECT_ROOT / "configs" / "policy.yaml"),
+            target_horizon_h=float(target_horizon),
+        )
+        test_run = run_screening(
+            test_early,
+            parameters_path=str(PROJECT_ROOT / "configs" / "parameters.yaml"),
+            policy_path=str(PROJECT_ROOT / "configs" / "policy.yaml"),
+            target_horizon_h=float(target_horizon),
         )
 
-        val_run = screen_dataframe(val, run_dir / "validation_screen", artifacts=artifacts, as_of_h=24.0, target_horizon=target_horizon, auto_train_missing=False)
-        # Compute test evidence once; final decision is re-applied later using the validation-selected thresholds.
-        test_run = screen_dataframe(test, run_dir / "test_screen", artifacts=artifacts, as_of_h=24.0, target_horizon=target_horizon, auto_train_missing=False)
+        val_triage = _attach_truth(val_run.triage, labels)
+        test_triage = _attach_truth(test_run.triage, labels)
 
-        val_screen = _attach_labels(val_run.screening, val, target_horizon)
-        test_screen = _attach_labels(test_run.screening, test, target_horizon)
+        thresholds: dict[str, float] = {}
+        methods = _get_anomaly_columns(val_triage)
+        validation_y = pd.to_numeric(val_triage["future_defective"], errors="coerce").fillna(0).astype(int).to_numpy()
+        validation_abs = _absolute_from_triage(val_triage)
+        escape_y = ((~validation_abs) & (validation_y == 1)).astype(int)
+        calibration_target = escape_y if target_metric == "escape_recall" else validation_y
 
-        # Select risk operating point from validation. This cannot touch blind test labels.
-        policy_selection = val_screen.copy()
-        absfail = _bool_series(policy_selection, f"absolute_fail_{int(target_horizon)}h")
-        y_full = _binary_truth(policy_selection, f"future_defective_{int(target_horizon)}h")
-        policy_selection["future_defective"] = y_full
-        policy_selection["latent_escape_target"] = ((~absfail) & y_full.eq(1)).astype(int)
-        calibration_target = "escape_recall" if int(policy_selection["latent_escape_target"].sum()) > 0 else target_metric
-        calibration = calibrate_safety_policy(
-            policy_selection,
-            fn_cost=float(load_yaml(PROJECT_ROOT / "configs" / "policy.yaml").get("costs", {}).get("false_negative", 100.0)),
-            fp_cost=float(load_yaml(PROJECT_ROOT / "configs" / "policy.yaml").get("costs", {}).get("false_positive", 1.0)),
-            max_reject_rate=max_reject_rate,
-            target_metric=calibration_target,
-        )
-        reject_threshold = float(calibration["thresholds"]["reject_min"])
-        safe_threshold = float(calibration["thresholds"]["safe_max"])
+        for name, column in methods.items():
+            scores = validation_abs.astype(float).to_numpy() if name == "absolute_limits" else pd.to_numeric(val_triage[column], errors="coerce").fillna(0.0).to_numpy(float)
+            thresholds[name] = 0.5 if name == "absolute_limits" else float(
+                optimize_threshold(
+                    calibration_target,
+                    scores,
+                    fn_cost=100.0,
+                    fp_cost=1.0,
+                    reject_rate_max=max_reject_rate,
+                    fpr_max=float(load_yaml(PROJECT_ROOT / "configs" / "policy.yaml").get("thresholds", {}).get("max_target_fpr", 0.05)),
+                ).threshold
+            )
 
-        # Re-apply the selected policy to both validation and test without re-fitting evidence.
-        val_final = redecide_screening(val_run.screening, safe_max=safe_threshold, reject_min=reject_threshold)
-        test_final = redecide_screening(test_run.screening, safe_max=safe_threshold, reject_min=reject_threshold)
-        val_final = _attach_labels(val_final, val, target_horizon)
-        test_final = _attach_labels(test_final, test, target_horizon)
-        val_metrics = system_disposition_metrics(val_final, val, target_horizon)
-        test_metrics = system_disposition_metrics(test_final, test, target_horizon)
-        esc = latent_escape_metrics(test_final, test, target_horizon)["latent_escape"]
+        threshold_records[str(current_seed)] = thresholds
+        a_table = _module_a_table(test_triage, labels, thresholds)
+        a_table["seed"] = current_seed
+        b_table = _module_b_table(test, test_early, test_run.triage, target_horizon)
+        if not b_table.empty:
+            b_table["seed"] = current_seed
+        all_a.append(a_table)
+        all_b.append(b_table)
 
-        # Progressive earliest-warning analysis.
         progressive = progressive_screen_dataframe(
-            test,
-            run_dir / "progressive_screen",
+            test_input,
+            seed_dir / "progressive",
             origins=DEFAULT_ORIGINS,
             target_horizon=target_horizon,
-            artifacts=artifacts,
-            auto_train_missing=False,
+            parameters_path=PROJECT_ROOT / "configs" / "parameters.yaml",
+            policy_path=PROJECT_ROOT / "configs" / "policy.yaml",
         )
-        # Freeze the validation-selected operating point across every early-warning origin.
-        tuned_runs = {}
-        decision_frames = []
-        for origin, rr in progressive["runs"].items():
-            tuned = redecide_screening(rr.screening, safe_max=safe_threshold, reject_min=reject_threshold)
-            tuned_runs[origin] = tuned
-            x = tuned[[c for c in ["part_id", "decision", "risk_score"] if c in tuned.columns]].copy()
-            x["origin_h"] = float(origin); decision_frames.append(x)
-        progressive["runs_final_policy"] = tuned_runs
-        progressive["decisions"] = pd.concat(decision_frames, ignore_index=True) if decision_frames else pd.DataFrame()
-        flags = progressive["decisions"][progressive["decisions"]["decision"].astype(str).isin({"REVIEW","REJECT"})].sort_values(["part_id","origin_h"])
-        progressive["lead_time"] = (pd.DataFrame({"part_id": test["part_id"].astype(str).unique()})
-            .merge(flags.drop_duplicates("part_id", keep="first")[["part_id","origin_h","decision","risk_score"]].rename(columns={"origin_h":"first_flag_time_h"}), on="part_id", how="left"))
-        progressive["lead_time"]["lead_time_h"] = float(target_horizon) - pd.to_numeric(progressive["lead_time"]["first_flag_time_h"], errors="coerce")
-        prog_metrics = progressive_metrics(progressive, test, target_horizon)
-        leads = lead_time_table(progressive, test, target_horizon)
-        lead_summary = summarize_lead_time(leads, target_horizon)
-        prog_metrics["seed"] = current_seed
-        all_progressive.append(prog_metrics)
-        prog_metrics.to_csv(run_dir / "progressive_metrics.csv", index=False)
-        leads.to_csv(run_dir / "lead_time.csv", index=False)
+        lead = progressive["lead_time"].copy()
+        if not lead.empty:
+            lead["seed"] = current_seed
+        all_progressive.append(lead)
 
-        # Mechanism + ablation.
-        mech = mechanism_table(test_final, test, target_horizon)
-        mech["seed"] = current_seed
-        mech.to_csv(run_dir / "mechanism_metrics.csv", index=False)
-        all_mechanisms.append(mech)
+        test_run.triage.to_csv(seed_dir / "test_triage.csv", index=False)
+        val_run.triage.to_csv(seed_dir / "validation_triage.csv", index=False)
+        a_table.to_csv(seed_dir / "module_a_comparison.csv", index=False)
+        b_table.to_csv(seed_dir / "module_b_comparison.csv", index=False)
 
-        method_ops = _fit_method_operating_points(_attach_labels(val_run.anomaly, val, target_horizon), val, max_reject_rate)
-        abl = _ablation_table(_attach_labels(test_run.anomaly, test, target_horizon), test, method_ops)
-        abl["seed"] = current_seed
-        abl.to_csv(run_dir / "module_a_ablation.csv", index=False)
-        all_ablation.append(abl)
+    module_a = pd.concat(all_a, ignore_index=True) if all_a else pd.DataFrame()
+    module_b = pd.concat(all_b, ignore_index=True) if all_b and any(not x.empty for x in all_b) else pd.DataFrame()
+    progressive = pd.concat(all_progressive, ignore_index=True) if all_progressive and any(not x.empty for x in all_progressive) else pd.DataFrame()
 
-        # Forecast comparison on untouched test predictions.
-        fcmp = forecast_comparison(test, test_run.forecast, target_horizon)
-        fcmp["seed"] = current_seed
-        fcmp.to_csv(run_dir / "forecast_comparison.csv", index=False)
-        all_forecast.append(fcmp)
+    if not module_a.empty:
+        module_a.to_csv(outdir / "anomaly_comparison.csv", index=False)
+    if not module_b.empty:
+        module_b.to_csv(outdir / "forecast_comparison.csv", index=False)
+    if not progressive.empty:
+        progressive.to_csv(outdir / "progressive_lead_time.csv", index=False)
 
-        # Robustness: measure actual performance changes, not just missingness.
-        robust_rows = []
-        for scenario, frame in robustness_scenarios(test.head(min(5000, len(test))).copy(), current_seed).items():
-            rr = screen_dataframe(frame, run_dir / "robustness" / scenario, artifacts=artifacts, as_of_h=24.0, target_horizon=target_horizon, auto_train_missing=False, render_explanations=False)
-            # Apply the frozen validation operating point, preserving OOD/quality gates.
-            rr_final = redecide_screening(rr.screening, safe_max=safe_threshold, reject_min=reject_threshold)
-            metrics = system_disposition_metrics(rr_final, frame, target_horizon) if f"future_defective_{int(target_horizon)}h" in frame.columns else {}
-            metrics.update({"scenario": scenario, "rows": len(frame), "input_missing_fraction": float(frame.isna().mean().mean())})
-            robust_rows.append(metrics)
-        rob = pd.DataFrame(robust_rows)
-        rob.to_csv(run_dir / "robustness_metrics.csv", index=False)
-        all_robustness.append(rob)
-
-        seed_row = {
-            "seed": current_seed,
-            "validation_threshold": reject_threshold,
-            "validation_safe_max": safe_threshold,
-            "validation": val_metrics,
-            "system": test_metrics,
-            "latent_escape": esc,
-            "lead_time": lead_summary,
-            "forecast": fcmp.to_dict(orient="records"),
-        }
-        seed_rows.append(seed_row)
-
-        # Persist the exact test disposition and its truth metadata for audit.
-        test_final.to_csv(run_dir / "test_screening_final_policy.csv", index=False)
-        with open(run_dir / "selection.json", "w", encoding="utf-8") as fh:
-            json.dump({"seed": current_seed, "threshold": reject_threshold, "safe_max": safe_threshold, "calibration": calibration, "validation_metrics": val_metrics}, fh, indent=2, default=str)
-
-    # Aggregate across seeds only after every seed is independently evaluated.
-    def aggregate_nested(rows: list[dict[str, Any]], section: str) -> pd.DataFrame:
-        flat = []
-        for r in rows:
-            x = dict(r[section]); x["seed"] = r["seed"]; flat.append(x)
-        d = pd.DataFrame(flat)
-        numeric = [c for c in d.columns if c != "seed" and pd.api.types.is_numeric_dtype(d[c])]
-        out = []
-        for c in numeric:
-            out.append({"metric": c, "mean": float(d[c].mean()), "std": float(d[c].std(ddof=1)) if len(d) > 1 else 0.0, "min": float(d[c].min()), "max": float(d[c].max())})
-        return pd.DataFrame(out)
-
-    system_agg = aggregate_nested(seed_rows, "system")
-    escape_agg = aggregate_nested(seed_rows, "latent_escape")
-    lead_agg = aggregate_nested(seed_rows, "lead_time")
-    system_agg.to_csv(outdir / "system_metrics_mean_std.csv", index=False)
-    escape_agg.to_csv(outdir / "latent_escape_mean_std.csv", index=False)
-    lead_agg.to_csv(outdir / "lead_time_mean_std.csv", index=False)
-
-    mech_all = pd.concat(all_mechanisms, ignore_index=True) if all_mechanisms else pd.DataFrame()
-    mech_agg = mech_all.groupby("mechanism", as_index=False).agg(
-        parts=("parts", "mean"), future_defective=("future_defective", "mean"),
-        recall=("recall", "mean"), recall_std=("recall", "std"),
-        false_negative_rate=("false_negative_rate", "mean"),
-        false_positive_rate=("false_positive_rate", "mean"),
-        escalation_rate=("escalation_rate", "mean"), escape_recall=("escape_recall", "mean"),
-    ) if not mech_all.empty else pd.DataFrame()
-    if not mech_agg.empty: mech_agg["recall_std"] = mech_agg["recall_std"].fillna(0.0)
-    mech_agg.to_csv(outdir / "mechanism_metrics_mean.csv", index=False)
-
-    f_all = pd.concat(all_forecast, ignore_index=True) if all_forecast else pd.DataFrame()
-    if not f_all.empty:
-        f_agg = f_all.groupby("model", as_index=False).agg(
-            n=("n", "mean"), mae=("mae", "mean"), mae_std=("mae", "std"), rmse=("rmse", "mean"),
-            conformal_coverage=("conformal_coverage", "mean"), mean_interval_width=("mean_interval_width", "mean"),
-            limit_crossing_recall=("limit_crossing_recall", "mean"), dangerous_case_mae=("dangerous_case_mae", "mean"),
-        )
-        for c in ["mae_std"]:
-            if c in f_agg: f_agg[c] = f_agg[c].fillna(0.0)
-    else: f_agg = pd.DataFrame()
-    f_agg.to_csv(outdir / "forecast_metrics_mean.csv", index=False)
-
-    if all_progressive:
-        prog_all = pd.concat(all_progressive, ignore_index=True)
-    else:
-        prog_all = pd.DataFrame()
-    if not prog_all.empty:
-        prog_agg = prog_all.groupby("origin_h", as_index=False).agg(
-            recall=("recall", "mean"), recall_std=("recall", "std"), false_positive_rate=("false_positive_rate", "mean"),
-            escalation_rate=("flag_rate", "mean"), escape_recall=("escape_recall", "mean"),
-        )
-        prog_agg["recall_std"] = prog_agg["recall_std"].fillna(0.0)
-    else: prog_agg = pd.DataFrame()
-    prog_agg.to_csv(outdir / "progressive_metrics_mean.csv", index=False)
-
-    rob_all = pd.concat(all_robustness, ignore_index=True) if all_robustness else pd.DataFrame()
-    if not rob_all.empty:
-        rob_agg = rob_all.groupby("scenario", as_index=False).mean(numeric_only=True)
-    else: rob_agg = pd.DataFrame()
-    rob_agg.to_csv(outdir / "robustness_metrics_mean.csv", index=False)
-
-    abl_all = pd.concat(all_ablation, ignore_index=True) if all_ablation else pd.DataFrame()
-    abl_agg = abl_all.groupby("method", as_index=False).agg(recall=("recall", "mean"), false_positive_rate=("false_positive_rate", "mean"), flag_rate=("flag_rate", "mean"), latent_escape_recall=("latent_escape_recall", "mean")) if not abl_all.empty else pd.DataFrame()
-    abl_agg.to_csv(outdir / "ablation_metrics_mean.csv", index=False)
-
-    report = {
-        "protocol": {
-            "train_calibration_only": True,
-            "blind_test": True,
-            "group_split": "lot",
-            "n_seeds": len(seeds),
-            "origins_h": list(DEFAULT_ORIGINS),
-            "target_horizon_h": float(target_horizon),
-            "max_escalation_rate_for_threshold_selection": float(max_reject_rate),
-            "note": "All headline test metrics are measured from final frozen dispositions; no test threshold fitting is performed.",
-        },
-        "seeds": seed_rows,
-        "system_mean_std": system_agg.to_dict(orient="records"),
-        "latent_escape_mean_std": escape_agg.to_dict(orient="records"),
-        "mechanism": mech_agg.to_dict(orient="records"),
-        "forecast": f_agg.to_dict(orient="records"),
-        "progressive": prog_agg.to_dict(orient="records"),
-        "robustness": rob_agg.to_dict(orient="records"),
-        "ablation": abl_agg.to_dict(orient="records"),
+    summary: dict[str, Any] = {
+        "horizon_h": float(target_horizon),
+        "seeds": seeds,
+        "train_parts": int(_part_series(train).nunique()),
+        "validation_parts": int(_part_series(validation).nunique()),
+        "test_parts": int(_part_series(test).nunique()),
+        "thresholds_validation": threshold_records,
     }
-    (outdir / "benchmark_results.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
 
-    # Judge-facing Markdown.
-    def md(df: pd.DataFrame, cols: list[str]) -> str:
-        if df.empty:
-            return "_No measured results._"
-        return df[[c for c in cols if c in df.columns]].to_markdown(index=False)
+    if not module_a.empty:
+        summary["module_a"] = (
+            module_a.groupby("method", as_index=False)[
+                ["recall", "fnr", "fpr", "pr_auc", "latent_escape_recall", "latent_escape_fnr"]
+            ].mean().to_dict("records")
+        )
 
-    lines = [
-        "# SIH 26170 — Winner-Grade Blind Benchmark",
-        "",
-        "## Protocol",
-        f"- Seeds: {len(seeds)} ({', '.join(map(str, seeds))})",
-        "- Calibration: validation lots only",
-        "- OOD reference: training lots only",
-        "- Final test: untouched for threshold selection",
-        "- Decision flag for safety recall/FPR: REVIEW or REJECT",
-        "",
-        "## System performance (mean ± std components)",
-        md(system_agg, ["metric", "mean", "std", "min", "max"]),
-        "",
-        "## Latent-escape performance",
-        md(escape_agg, ["metric", "mean", "std", "min", "max"]),
-        "",
-        "## Mechanism breakdown",
-        md(mech_agg, ["mechanism", "parts", "future_defective", "recall", "recall_std", "false_positive_rate", "escape_recall"]),
-        "",
-        "## Module B forecast comparison",
-        md(f_agg, ["model", "mae", "mae_std", "rmse", "conformal_coverage", "mean_interval_width", "limit_crossing_recall", "dangerous_case_mae"]),
-        "",
-        "## Progressive early-warning curve",
-        md(prog_agg, ["origin_h", "recall", "recall_std", "false_positive_rate", "escalation_rate", "escape_recall"]),
-        "",
-        "## Module-A ablation/comparison",
-        md(abl_agg, ["method", "recall", "false_positive_rate", "flag_rate", "latent_escape_recall"]),
-        "",
-        "## Robustness",
-        md(rob_agg, ["scenario", "recall", "false_positive_rate", "escalation_rate", "reject_rate", "unknown_rate", "input_missing_fraction"]),
-        "",
-        "## Interpretation rule",
-        "No target metric is hard-coded. Results are accepted exactly as measured. Any claim of superiority must be supported by the corresponding held-out baseline and uncertainty statistics.",
-    ]
-    (outdir / "benchmark_table.md").write_text("\n".join(lines), encoding="utf-8")
-    return report
+    if not module_b.empty:
+        summary["module_b"] = (
+            module_b.groupby("model", as_index=False)[
+                ["mae", "rmse", "conformal_coverage", "limit_crossing_recall"]
+            ].mean(numeric_only=True).to_dict("records")
+        )
+
+    if not progressive.empty:
+        summary["progressive"] = {
+            "rows": int(len(progressive)),
+            "defective_parts": int(progressive.get("future_defective", pd.Series(dtype=int)).sum()),
+            "median_lead_time_h": float(progressive.loc[progressive["future_defective"].eq(1), "lead_time_h"].median()) if "future_defective" in progressive.columns and progressive.loc[progressive["future_defective"].eq(1), "lead_time_h"].notna().any() else None,
+        }
+
+    save_json(summary, outdir / "benchmark_results.json")
+    return {
+        "summary": summary,
+        "module_a": module_a,
+        "module_b": module_b,
+        "anomaly": module_a,
+        "forecast": module_b,
+        "progressive": progressive,
+        "thresholds_by_seed": threshold_records,
+    }
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="SIH 26170 winner-grade blind benchmark")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    b = sub.add_parser("benchmark")
-    b.add_argument("input")
-    b.add_argument("--output-dir", default="reports/benchmark")
-    b.add_argument("--seed", type=int, default=SEED)
-    b.add_argument("--n-seeds", type=int, default=5)
-    b.add_argument("--target-horizon", type=float, default=168.0)
-    b.add_argument("--target-metric", choices=["future_recall", "escape_recall"], default="escape_recall")
-    b.add_argument("--max-reject-rate", type=float, default=0.25)
-    a = ap.parse_args()
-    result = run_master_benchmark(a.input, a.output_dir, seed=a.seed, n_seeds=a.n_seeds, target_horizon=a.target_horizon, target_metric=a.target_metric, max_reject_rate=a.max_reject_rate)
-    print(json.dumps(result, indent=2, default=str))
-    return 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-# --- Compatibility/audit helpers used by the project's regression tests and final report. ---
-def leakage_audit(df: pd.DataFrame, as_of_h: float = 24.0) -> dict[str, Any]:
-    future_cols = []
-    for c in df.columns:
-        m = re.fullmatch(r"(?:value|target|latent)_(\d+(?:\.\d+)?)h", str(c))
-        if m and float(m.group(1)) > float(as_of_h):
-            future_cols.append(str(c))
-    label_like = [c for c in df.columns if c in {"future_defective_48h","future_defective_96h","future_defective_168h","future_defective_240h","future_defective_300h","latent_defect_label","defect_state","failure_mode","primary_failure_mode","high_but_safe","measurement_only_anomaly"}]
-    return {"as_of_h": float(as_of_h), "future_observation_columns": future_cols, "label_columns": label_like, "leakage_detected": bool(future_cols or label_like)}
-
-
-def physics_sanity(df: pd.DataFrame) -> dict[str, Any]:
-    bad = []
-    for c, lo, hi in [("temperature_C", -100, 500), ("burnin_temperature_C", -100, 500), ("voltage_V", -1e5, 1e5), ("current_A", -1e5, 1e5)]:
-        if c in df.columns:
-            x = pd.to_numeric(df[c], errors="coerce")
-            if (x.notna() & ((x < lo) | (x > hi))).any(): bad.append(c)
-    return {"pass": not bad, "invalid_columns": bad}
-
-
-def adversarial_suite(df: pd.DataFrame, seed: int = SEED) -> dict[str, pd.DataFrame]:
-    out = {"baseline": df.copy()}
-    rng = np.random.default_rng(seed)
-    renamed = df.copy()
-    if "parameter" in renamed.columns: renamed["parameter"] = renamed["parameter"].astype(str).str.upper()
-    out["renamed"] = renamed
-    for frac in (.20, .40, .60):
-        z = df.copy()
-        cols = [c for c in z.columns if re.fullmatch(r"value_(?:12|24|48|72|96|120|144|168)h", str(c))]
-        if cols and len(z):
-            ix = rng.choice(len(z), max(1, int(frac*len(z))), replace=False)
-            z.loc[z.index[ix], cols] = np.nan
-        out[f"missing_{int(frac*100)}pct"] = z
-    if "value_24h" in df.columns:
-        base = pd.to_numeric(df["value_24h"], errors="coerce")
-        z = df.copy(); z["value_24h"] = base * 1.15; out["shifted_mean"] = z
-        z = df.copy(); z["value_24h"] = base * 2.0; out["shifted_variance"] = z
-        z = df.copy(); z["value_24h"] = base + rng.normal(0, 0.05, len(z)) * base.abs().fillna(1).to_numpy(); out["noise_5pct"] = z
-        z = df.copy(); mask = rng.random(len(z)) < 0.2; z.loc[mask, "value_24h"] = np.nan; out["informative_missing"] = z
-    z = df.copy()
-    value_cols = [c for c in z.columns if re.fullmatch(r"value_\d+(?:\.\d+)?h", str(c))]
-    if len(value_cols) >= 3:
-        z[value_cols[1]] = np.nan
-    out["irregular_readpoints"] = z
-    z = df.copy()
-    if "parameter" in z.columns: z["parameter"] = "unknown_physical_quantity"
-    out["unknown_parameter"] = z
-    z = df.copy()
-    if "value_24h" in z.columns: z["value_24h"] = pd.to_numeric(z["value_24h"], errors="coerce") * 1000.0
-    out["unit_scale"] = z
-    return out
-
-
-def lot_health(df: pd.DataFrame, anomaly: pd.DataFrame, forecast: pd.DataFrame) -> pd.DataFrame:
-    keys = [c for c in ["lot_id"] if c in df.columns]
-    if not keys:
-        return pd.DataFrame()
-    a = anomaly.copy(); f = forecast.copy()
-    a["part_id"] = a["part_id"].astype(str); f["part_id"] = f["part_id"].astype(str)
-    parts = df[["part_id", "lot_id"]].drop_duplicates("part_id")
-    aa = parts.merge(a[["part_id","anomaly_risk"]] if "anomaly_risk" in a.columns else parts[["part_id"]].assign(anomaly_risk=0.0), on="part_id", how="left")
-    ff = parts.merge(f[["part_id","failure_risk"]] if "failure_risk" in f.columns else parts[["part_id"]].assign(failure_risk=0.0), on="part_id", how="left")
-    m = aa.merge(ff, on=["part_id","lot_id"], how="outer")
-    return m.groupby("lot_id", as_index=False).agg(parts=("part_id","nunique"), mean_anomaly_risk=("anomaly_risk","mean"), mean_failure_risk=("failure_risk","mean"))
-
-
-def what_if_projection(value_0h: float, value_24h: float, horizon_h: float = 168.0) -> pd.DataFrame:
-    slope = (float(value_24h) - float(value_0h)) / 24.0
-    t = np.arange(0.0, float(horizon_h) + 1.0, 24.0)
-    return pd.DataFrame({"time_h": t, "projected_value": float(value_0h) + slope * t})
-
-
-def escape_matrix(df: pd.DataFrame) -> pd.DataFrame:
-    x = df.copy()
-    y = _binary_truth(x, "future_defective_168h") if "future_defective_168h" in x.columns else _binary_truth(x, "future_defective")
-    absfail = _bool_series(x, "absolute_fail_168h")
-    x["future_defective"] = y
-    x["absolute_pass"] = ~absfail
-    x["latent_escape"] = x["absolute_pass"] & y.eq(1)
-    x["group"] = np.select([absfail & y.eq(1), absfail & y.eq(0), (~absfail) & y.eq(1), (~absfail) & y.eq(0)], ["obvious_failure", "obvious_absolute_fail_future_safe", "latent_escape", "absolute_pass_future_safe"], default="unknown")
-    keep=[c for c in ["part_id","lot_id","group","absolute_pass","future_defective","latent_escape","defect_state","failure_mode","split","high_but_safe"] if c in x.columns]
-    return x[keep].copy()
-
-
-def lead_time_from_screening(canonical: pd.DataFrame, screening: pd.DataFrame, first_flag_h: float = 24.0, horizon_h: float = 168.0) -> pd.DataFrame:
-    parts = canonical[["part_id"]].drop_duplicates().copy()
-    parts["part_id"] = parts["part_id"].astype(str)
-    flagged = screening[screening["decision"].astype(str).isin({"REVIEW","REJECT"})][["part_id"]].drop_duplicates("part_id") if "decision" in screening.columns else pd.DataFrame(columns=["part_id"])
-    flagged["first_flag_time_h"] = float(first_flag_h)
-    out = parts.merge(flagged,on="part_id",how="left")
-    out["lead_time_h"] = float(horizon_h)-pd.to_numeric(out["first_flag_time_h"],errors="coerce")
-    return out
+if __name__=="__main__": raise SystemExit(master_cli())

@@ -1,48 +1,74 @@
-import { useEffect, useMemo, useState } from 'react'
-import type { ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   Activity,
+  Award,
+  ChevronRight,
   ClipboardCheck,
+  Cpu,
   Database,
   FileSearch,
   Layers3,
+  Plus,
+  PlusCircle,
+  RefreshCw,
+  ShieldAlert,
   ShieldCheck,
+  UploadCloud,
   X,
-  Command,
-  ChevronRight,
 } from 'lucide-react'
 import { DashboardPage } from '../pages/Dashboard'
 import { ComponentPage } from '../pages/ComponentIntelligence'
 import { EvidencePage } from '../pages/EvidenceExplainability'
 import { AuditPage } from '../pages/AuditBenchmark'
+import { NewScreeningPage } from '../pages/NewScreening'
 import { useApi } from '../hooks/useApi'
-import type { ComponentSummary } from '../types/api'
+import type { ComponentIntelligence, ComponentSummary, ScreeningResponse, SystemStatus } from '../types/api'
 import { StatusBadge } from '../components/common/StatusBadge'
-import { parseList, num } from '../utils/format'
+import { parseList } from '../utils/format'
+import { ComplianceCertificateModal } from '../components/common/ComplianceCertificateModal'
 
-type View = 'overview' | 'component' | 'evidence' | 'audit'
 
-const NAV: { id: View; label: string; compact: string; icon: ReactNode }[] = [
-  { id: 'overview', label: 'Screening Overview', compact: 'Overview', icon: <Layers3 size={18} /> },
-  { id: 'component', label: 'Component Intelligence', compact: 'Component', icon: <Activity size={18} /> },
-  { id: 'evidence', label: 'Evidence & Explainability', compact: 'Evidence', icon: <FileSearch size={18} /> },
-  { id: 'audit', label: 'Audit / Benchmark', compact: 'Audit', icon: <ClipboardCheck size={18} /> },
+type View = 'overview' | 'component' | 'evidence' | 'audit' | 'intake'
+type SourceMode = 'active' | 'demo'
+
+const NAV: { id: Exclude<View, 'intake'>; label: string; compact: string; icon: ReactNode }[] = [
+  { id: 'overview', label: 'Overview', compact: 'Overview', icon: <Layers3 size={19} /> },
+  { id: 'component', label: 'Component Passport', compact: 'Component Passport', icon: <Cpu size={19} /> },
+  { id: 'evidence', label: 'Evidence', compact: 'Evidence', icon: <FileSearch size={19} /> },
+  { id: 'audit', label: 'Audit', compact: 'Audit', icon: <Award size={19} /> },
 ]
 
 export function App() {
   const [view, setView] = useState<View>('overview')
+  const [source, setSource] = useState<SourceMode>('demo')
   const [selected, setSelected] = useState<string | null>(null)
+  const [session, setSession] = useState<ScreeningResponse | null>(null)
   const [whyOpen, setWhyOpen] = useState(false)
-  const components = useApi<{ items: ComponentSummary[]; count: number }>('/api/components?limit=250')
-  const health = useApi<{ status: string; pipeline: string; models: string; demo_mode: boolean }>('/api/health')
-  const componentPacket = useApi<any>(selected ? `/api/components/${encodeURIComponent(selected)}` : null)
 
-  const preferred = useMemo(() => {
-    const rows = components.data?.items ?? []
-    return [...rows]
-      .sort((a, b) => (b.risk_score ?? -1) - (a.risk_score ?? -1))[0]?.part_id ?? null
-  }, [components.data])
+  const sourceQ = source === 'demo' ? '?source=demo' : ''
+  const components = useApi<{ items: ComponentSummary[]; count: number }>(
+    `/api/components?limit=500${source === 'demo' ? '&source=demo' : ''}`
+  )
+  const health = useApi<SystemStatus>(`/api/health${sourceQ}`)
+  const validation = useApi<any>(`/api/validation${sourceQ}`)
+  const packet = useApi<ComponentIntelligence>(
+    selected ? `/api/components/${encodeURIComponent(selected)}${source === 'demo' ? '?source=demo' : ''}` : null
+  )
+
+  const preferred = useMemo(
+    () =>
+      [...(components.data?.items ?? [])].sort(
+        (a, b) => (b.risk_score ?? -1) - (a.risk_score ?? -1)
+      )[0]?.part_id ?? null,
+    [components.data]
+  )
+
+  useEffect(() => {
+    if (selected && components.data?.items?.every((c) => c.part_id !== selected)) {
+      setSelected(null)
+    }
+  }, [components.data, selected])
 
   useEffect(() => {
     if (!selected && preferred) setSelected(preferred)
@@ -53,11 +79,6 @@ export function App() {
     setView('component')
   }
 
-  const openWhy = (id: string) => {
-    setSelected(id)
-    setWhyOpen(true)
-  }
-
   const navigate = (next: View) => {
     if ((next === 'component' || next === 'evidence') && !selected && preferred) {
       setSelected(preferred)
@@ -65,16 +86,44 @@ export function App() {
     setView(next)
   }
 
-  const selectedSummary = components.data?.items.find(x => x.part_id === selected)
-  const activeLabel = NAV.find(x => x.id === view)?.compact ?? 'Overview'
+  const selectedSummary = components.data?.items.find((x) => x.part_id === selected)
+  const activeLabel =
+    view === 'intake' ? 'New Screening' : NAV.find((x) => x.id === view)?.compact ?? 'Overview'
+
+  const reloadAll = () => {
+    components.reload()
+    health.reload()
+    validation.reload()
+  }
+
+  const completeRun = (result: ScreeningResponse, mode: SourceMode) => {
+    setSession(result)
+    setSource(mode)
+    setSelected(result.components[0]?.part_id ?? null)
+    setView('overview')
+    components.reload()
+    health.reload()
+    validation.reload()
+  }
+
+  const dashboardSession =
+    source === 'demo' && session?.run_id === 'demo_scenario'
+      ? session
+      : session?.run_id?.startsWith('live_')
+      ? session
+      : null
 
   return (
     <div className="app">
-      <aside className="rail" aria-label="Primary navigation">
-        <div className="brandMark">ACS</div>
-        <div className="railCaption">BURN-IN / EEE</div>
+      {/* Aerospace Mission Control Rail Navigation */}
+      <aside className="rail" aria-label="Aerospace mission navigation">
+        <div className="brandMark" title="Adaptive Component Screening — Mission Control">
+          ACS
+          <span>AERO</span>
+        </div>
+        <div className="railCaption">MISSION</div>
         <div className="railNav">
-          {NAV.map(item => (
+          {NAV.map((item) => (
             <NavButton
               key={item.id}
               active={view === item.id}
@@ -82,61 +131,130 @@ export function App() {
               onClick={() => navigate(item.id)}
             >
               {item.icon}
-              <span className="railLabel">{item.compact}</span>
             </NavButton>
           ))}
+          <NavButton
+            active={view === 'intake'}
+            title="New Screening"
+            onClick={() => navigate('intake')}
+          >
+            <PlusCircle size={19} />
+          </NavButton>
         </div>
-        <div className="railFooter">ENGINEERING INTELLIGENCE</div>
+        <div className="railFooter">ACS</div>
       </aside>
 
+      {/* Main Mission View Area */}
       <main className="main">
         <header className="topbar">
           <div className="topIdentity">
-            <div className="eyebrow">ADAPTIVE COMPONENT SCREENING</div>
-            <div className="title">EEE Burn-In Intelligence Console</div>
+            <div className="eyebrow" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span>ACS</span> · <span>ADAPTIVE COMPONENT SCREENING</span>
+            </div>
+            <div className="title">SCREENING OVERVIEW</div>
           </div>
+
           <div className="topContext">
-            <div className="contextPath"><span>ACS</span><ChevronRight size={11} /><span>{activeLabel}</span>{selectedSummary && view !== 'overview' && <><ChevronRight size={11} /><span className="mono">{selectedSummary.part_id}</span></>}</div>
+            <div className="contextPath">
+              <span>ACS</span>
+              <ChevronRight size={11} />
+              <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{activeLabel}</span>
+              {selectedSummary && view !== 'overview' && view !== 'intake' && (
+                <>
+                  <ChevronRight size={11} />
+                  <span className="mono">{selectedSummary.part_id}</span>
+                </>
+              )}
+            </div>
+
             <div className="topstate">
-              <div className="statusChip"><span className="dot" /> PIPELINE READY</div>
-              {health.data?.demo_mode && <div className="statusChip demoChip"><span className="demoPulse" /> DEMO SCENARIO</div>}
-              <div className="statusChip"><Database size={12} /> MODEL ARTIFACTS</div>
+              <button className="btn topNew" onClick={() => setView('intake')}>
+                <UploadCloud size={13} /> NEW SCREENING
+              </button>
+
+              <div className="statusChip">
+                <span className={`dot ${health.data?.status === 'ok' ? '' : 'alert'}`} />
+                <span style={{ color: 'var(--ink)' }}>READY</span>
+              </div>
+
+              <div className="statusChip">
+                <ShieldCheck size={12} color="var(--safe)" />
+                <span style={{ color: validation.data?.ok ? 'var(--safe)' : 'var(--review)' }}>
+                  {validation.data?.ok ? 'VALIDATED' : 'CHECK'}
+                </span>
+              </div>
+
+              <button className="iconButton" title="Refresh telemetry" onClick={reloadAll}>
+                <RefreshCw size={13} />
+              </button>
             </div>
           </div>
         </header>
 
         <AnimatePresence mode="wait">
           {view === 'overview' && (
-            <ViewFrame keyValue="overview">
-              <DashboardPage onOpen={openComponent} onOpenEvidence={() => navigate('evidence')} />
+            <ViewFrame keyValue={`overview-${source}`}>
+              <DashboardPage
+                onOpen={openComponent}
+                onNewRun={() => setView('intake')}
+                source={source}
+                session={dashboardSession}
+              />
             </ViewFrame>
           )}
+
           {view === 'component' && selected && (
-            <ViewFrame keyValue="component">
-              <ComponentPage partId={selected} onBack={() => navigate('overview')} onWhy={() => openWhy(selected)} onOpenEvidence={() => navigate('evidence')} />
+            <ViewFrame keyValue={`component-${source}-${selected}`}>
+              <ComponentPage
+                partId={selected}
+                source={source}
+                onBack={() => navigate('overview')}
+                onWhy={() => setWhyOpen(true)}
+                onOpenEvidence={() => navigate('evidence')}
+              />
             </ViewFrame>
           )}
+
           {view === 'evidence' && selected && (
-            <ViewFrame keyValue="evidence">
-              <EvidencePage partId={selected} onBack={() => navigate('component')} onOpenComponent={() => navigate('component')} />
+            <ViewFrame keyValue={`evidence-${source}-${selected}`}>
+              <EvidencePage
+                partId={selected}
+                source={source}
+                onBack={() => navigate('component')}
+                onOpenComponent={() => navigate('component')}
+              />
             </ViewFrame>
           )}
+
           {view === 'audit' && (
-            <ViewFrame keyValue="audit">
-              <AuditPage onInspect={openComponent} />
+            <ViewFrame keyValue={`audit-${source}`}>
+              <AuditPage source={source} onInspect={openComponent} />
             </ViewFrame>
           )}
-          {((view === 'component' || view === 'evidence') && !selected) && (
-            <ViewFrame keyValue="select"><EmptySelection onBack={() => navigate('overview')} /></ViewFrame>
+
+          {view === 'intake' && (
+            <ViewFrame keyValue="intake">
+              <NewScreeningPage onComplete={completeRun} onCancel={() => navigate('overview')} />
+            </ViewFrame>
+          )}
+
+          {(view === 'component' || view === 'evidence') && !selected && (
+            <ViewFrame keyValue="empty">
+              <div className="page">
+                <div className="emptyState panel">
+                  <ShieldAlert size={20} color="var(--accent)" />
+                  <div>
+                    <div className="panelTitle">No Component Selected</div>
+                    <p>Select a telemetry record from the Screening Matrix to inspect Digital Passport.</p>
+                  </div>
+                </div>
+              </div>
+            </ViewFrame>
           )}
         </AnimatePresence>
-      </main>
 
-      <AnimatePresence>
-        {whyOpen && componentPacket.data && (
-          <WhyDrawer data={componentPacket.data} onClose={() => setWhyOpen(false)} />
-        )}
-      </AnimatePresence>
+        {whyOpen && packet.data && <WhyDrawer data={packet.data} onClose={() => setWhyOpen(false)} source={source} />}
+      </main>
     </div>
   )
 }
@@ -146,108 +264,129 @@ function ViewFrame({ keyValue, children }: { keyValue: string; children: ReactNo
     <motion.div
       key={keyValue}
       className="viewTransition"
-      initial={{ opacity: 0, y: 8 }}
+      initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -8 }}
-      transition={{ duration: 0.18 }}
+      exit={{ opacity: 0, y: -6 }}
+      transition={{ duration: 0.16 }}
     >
       {children}
     </motion.div>
   )
 }
 
-function NavButton({ active, title, onClick, children }: { active: boolean; title: string; onClick: () => void; children: ReactNode }) {
+function NavButton({
+  active,
+  title,
+  onClick,
+  children,
+}: {
+  active: boolean
+  title: string
+  onClick: () => void
+  children: ReactNode
+}) {
   return (
-    <button className={`railButton ${active ? 'active' : ''}`} title={title} aria-label={title} onClick={onClick}>
+    <button
+      className={`railButton ${active ? 'active' : ''}`}
+      title={title}
+      aria-label={title}
+      onClick={onClick}
+    >
       {children}
     </button>
   )
 }
 
-function EmptySelection({ onBack }: { onBack: () => void }) {
-  return (
-    <div className="page">
-      <div className="emptyState panel">
-        <ShieldCheck size={18} />
-        <div>
-          <div className="panelTitle">No component selected</div>
-          <p>Select a component from Screening Overview to inspect its intelligence packet.</p>
-        </div>
-        <button className="btn primary" onClick={onBack}>Back to screening</button>
-      </div>
-    </div>
-  )
-}
-
-function WhyDrawer({ data, onClose }: { data: any; onClose: () => void }) {
+function WhyDrawer({ data, onClose, source = 'demo' }: { data: ComponentIntelligence; onClose: () => void; source?: 'active' | 'demo' }) {
+  const [certModalOpen, setCertModalOpen] = useState(false)
   const c = data.component
-  const exp = data.explanation || {}
-  const findings = parseList(exp.model_findings)
-  const policy = parseList(exp.policy_reasoning)
-  const facts = parseList(exp.facts)
-  const cf = parseList(exp.counterfactuals)
-  const evidence = Array.isArray(data.anomaly_evidence) ? data.anomaly_evidence : []
-  const strongest = [...evidence].sort((a: any, b: any) => (b.score ?? -1) - (a.score ?? -1))[0]
+  const e = data.explanation || {}
+  const facts = parseList(e.facts)
+  const findings = parseList(e.model_findings)
+  const policy = parseList(e.policy_reasoning)
+  const cf = parseList(e.counterfactuals)
 
   return (
     <>
-      <motion.div className="drawerOverlay" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} />
+      {certModalOpen && <ComplianceCertificateModal partId={c.part_id} source={source} onClose={() => setCertModalOpen(false)} />}
+      <motion.div
+        className="drawerOverlay"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        onClick={onClose}
+      />
       <motion.aside
         className="drawer"
-        initial={{ x: 590 }} animate={{ x: 0 }} exit={{ x: 590 }}
-        transition={{ type: 'spring', stiffness: 340, damping: 32 }}
+        initial={{ x: 600 }}
+        animate={{ x: 0 }}
+        exit={{ x: 600 }}
+        transition={{ type: 'spring', stiffness: 350, damping: 32 }}
       >
         <div className="drawerHead">
           <div>
             <div className="eyebrow">ENGINEERING EVIDENCE RECORD</div>
-            <div className="drawerTitle">WHY THIS DECISION?</div>
-            <div className="mono drawerPart">{c.part_id}</div>
+            <div className="drawerTitle" style={{ color: 'var(--ink)' }}>
+              WHY THIS DECISION?
+            </div>
+            <div className="mono drawerPart" style={{ color: 'var(--accent)' }}>
+              {c.part_id}
+            </div>
           </div>
-          <button className="close" onClick={onClose} aria-label="Close evidence drawer"><X size={17} /></button>
+          <button className="close" onClick={onClose}>
+            <X size={17} />
+          </button>
         </div>
-
         <div className="drawerDecision">
           <StatusBadge decision={c.decision} large />
-          <span className="smallcaps">Risk <b className="mono">{c.risk_score == null ? '—' : Number(c.risk_score).toFixed(2)}</b></span>
-          <span className="smallcaps">OOD <b>{c.ood_status}</b></span>
-          {strongest && <span className="smallcaps">Primary <b>{strongest.name}</b></span>}
+          <span className="smallcaps">
+            RISK <b style={{ color: 'var(--ink)' }}>{c.risk_score == null ? '—' : Number(c.risk_score).toFixed(2)}</b>
+          </span>
+          <span className="smallcaps">
+            OOD <b style={{ color: 'var(--ink)' }}>{c.ood_status}</b>
+          </span>
         </div>
-
-        <WhySection n="01" title="OBSERVATION" lines={facts.length ? facts.slice(0, 6) : ['No persisted observation narrative is available.']} />
-        <WhySection n="02" title="INFERENCE" lines={findings.length ? findings.slice(0, 6) : ['No persisted model findings are available.']} />
-        <WhySection n="03" title="DECISION" lines={policy.length ? policy.slice(0, 5) : [exp.why_this_decision || 'No persisted policy narrative is available.']} />
-        <WhySection
+        <div style={{ margin: '14px 0', padding: '12px', background: 'rgba(0, 240, 255, 0.08)', border: '1px solid var(--line)', borderRadius: 8 }}>
+          <button className="btn primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => setCertModalOpen(true)}>
+            <Award size={14} /> OFFICIAL FLIGHT TRAVELER CERTIFICATE
+          </button>
+        </div>
+        <DrawerSection n="01" title="OBSERVATION" lines={facts.slice(0, 6)} />
+        <DrawerSection n="02" title="INFERENCE" lines={findings.slice(0, 6)} />
+        <DrawerSection n="03" title="DECISION POLICY" lines={policy.slice(0, 5)} />
+        <DrawerSection
           n="04"
           title="WHY NOT AUTOMATIC REJECT?"
           lines={
             c.decision === 'REVIEW'
               ? [
-                  data.decision?.hard_limit_violation ? 'A hard-limit condition is present; this is a safety-critical signal.' : 'Current engineering limits do not establish an unconditional hard reject.',
-                  data.forecast?.predicted_limit_exceedance ? 'Future-limit evidence is interval-aware and is not treated as a causal failure claim.' : 'The forecast alone is not treated as an unconditional rejection rule.',
+                  'Current evidence is routed to engineering review rather than unconditional rejection.',
+                  'Forecast evidence is interval-aware and remains subject to epistemic uncertainty.',
                 ]
-              : c.decision === 'REJECT'
-                ? ['The persisted safety policy already supports REJECT for this component.', 'Human disposition remains part of downstream engineering handling.']
-                : ['No autonomous rejection condition is present in the persisted decision trace.']
+              : [
+                  'The persisted safety disposition does not require an automatic reject narrative beyond its recorded policy state.',
+                ]
           }
         />
-        <WhySection n="05" title="WHAT WOULD CHANGE THE DECISION?" lines={cf.length ? cf.slice(0, 3) : [exp.specific_counterfactual || 'No single evidence change was sufficient to define a safe counterfactual.']} />
-
-        <div className="drawerNote">
-          <Command size={13} />
-          Persisted analytical evidence only. The interface does not invent an LLM-generated causal opinion.
-        </div>
+        <DrawerSection n="05" title="WHAT WOULD CHANGE THE DECISION?" lines={cf.slice(0, 4)} />
       </motion.aside>
     </>
   )
 }
 
-function WhySection({ n, title, lines }: { n: string; title: string; lines: string[] }) {
+function DrawerSection({ n, title, lines }: { n: string; title: string; lines: string[] }) {
   return (
     <section className="whySection">
-      <div className="whyNumber">{n}</div>
+      <div className="whyNumber" style={{ color: 'var(--accent)' }}>
+        {n}
+      </div>
       <div>
-        <h4>{title}</h4>
-        <ul>{lines.map((x, i) => <li key={i}>{x}</li>)}</ul>
+        <h4 style={{ color: 'var(--soft)' }}>{title}</h4>
+        <ul>
+          {(lines.length ? lines : ['No persisted narrative evidence available.']).map((x, i) => (
+            <li key={i}>{x}</li>
+          ))}
+        </ul>
       </div>
     </section>
   )

@@ -1,319 +1,522 @@
-"""Universal, model-independent feature engine for component screening.
-
-Strictly enforces information boundaries (as_of_h) to prevent future telemetry 
-leakage and safely handles missing lot/family data.
-"""
 from __future__ import annotations
 
-import argparse
-import hashlib
-import json
-import math
-from pathlib import Path
-from typing import Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
 
-from src.ingest import CANONICAL_COLUMNS, Canonicalizer, ParameterOntology, SchemaProfiler, _project_configs
 
-REQUIRED_CANONICAL = {
-    "observation_id", "part_id", "lot_id", "component_family", "parameter",
-    "value", "time_h", "test_stage", "test_method", "temperature_C",
-    "burnin_temperature_C", "voltage_V", "current_A", "stress_mode",
-    "measurement_status", "censoring", "quality_flag"
-}
+@dataclass(frozen=True)
+class FeatureConfig:
+    min_reference_group_size: int = 8
+    mad_epsilon: float = 1e-9
+    ewma_alpha: float = 0.25
+    cusum_drift: float = 0.50
+    cusum_threshold: float = 2.50
 
-def _finite_series(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
 
-def _safe_div(num: pd.Series, den: pd.Series) -> pd.Series:
-    den = den.where(np.abs(den) > 1e-15)
-    return num / den
+def robust_mad(
+    values: np.ndarray | pd.Series,
+    epsilon: float = 1e-9,
+) -> float:
+    array = pd.to_numeric(
+        pd.Series(values),
+        errors="coerce",
+    ).dropna().to_numpy(dtype=float)
 
-def _mad(s: pd.Series) -> float:
-    x = s.dropna().to_numpy(dtype=float)
-    if x.size == 0: return np.nan
-    return float(np.median(np.abs(x - np.median(x))))
+    if array.size == 0:
+        return float("nan")
 
-def _iqr(s: pd.Series) -> float:
-    x = s.dropna().to_numpy(dtype=float)
-    if x.size == 0: return np.nan
-    return float(np.percentile(x, 75) - np.percentile(x, 25))
+    median = float(np.median(array))
+    mad = float(np.median(np.abs(array - median)))
 
-def _percentile_rank(values: pd.Series) -> pd.Series:
-    return values.rank(method="average", pct=True)
+    return max(mad, epsilon)
 
-def _stable_category_code(series: pd.Series) -> pd.Series:
-    def code(value: object) -> int:
-        token = "<MISSING>" if value is None or pd.isna(value) else str(value)
-        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-        return int.from_bytes(digest, byteorder="big", signed=False) & 0x7FFFFFFFFFFFFFFF
-    return series.map(code).astype("int64")
 
-def _direction_factor(direction: str | None) -> float:
-    if direction == "lower_is_worse": return -1.0
-    return 1.0
+def _reference(
+    values: pd.Series,
+    minimum_size: int,
+    epsilon: float,
+) -> tuple[float, float] | None:
+    numeric = pd.to_numeric(
+        values,
+        errors="coerce",
+    ).dropna()
 
-def _validate_canonical_frame(df: pd.DataFrame) -> None:
-    missing = sorted(REQUIRED_CANONICAL.difference(df.columns))
+    if len(numeric) < minimum_size:
+        return None
+
+    median = float(np.median(numeric))
+    mad = robust_mad(numeric, epsilon)
+
+    return median, mad
+
+
+def _reference_for_row(
+    frame: pd.DataFrame,
+    row: pd.Series,
+    parameter: str,
+    config: FeatureConfig,
+) -> tuple[float, float, str]:
+    candidates: list[tuple[str, pd.Series]] = []
+
+    base = frame[frame["parameter"].astype(str).eq(str(parameter))]
+
+    lot_id = str(row.get("lot_id", ""))
+    family = str(row.get("family", ""))
+    batch_id = str(row.get("batch_id", ""))
+
+    if lot_id:
+        candidates.append(
+            (
+                "LOT",
+                base.loc[
+                    base["lot_id"].astype(str).eq(lot_id),
+                    "value",
+                ],
+            )
+        )
+
+    if family:
+        candidates.append(
+            (
+                "FAMILY",
+                base.loc[
+                    base["family"].astype(str).eq(family),
+                    "value",
+                ],
+            )
+        )
+
+    if batch_id:
+        candidates.append(
+            (
+                "BATCH",
+                base.loc[
+                    base["batch_id"].astype(str).eq(batch_id),
+                    "value",
+                ],
+            )
+        )
+
+    candidates.append(("GLOBAL", base["value"]))
+
+    for level, values in candidates:
+        result = _reference(
+            values,
+            config.min_reference_group_size,
+            config.mad_epsilon,
+        )
+
+        if result is not None:
+            return result[0], result[1], level
+
+    fallback = _reference(base["value"], 2, config.mad_epsilon)
+
+    if fallback is None:
+        return np.nan, np.nan, "INSUFFICIENT"
+
+    return fallback[0], fallback[1], "GLOBAL"
+
+
+def _robust_slope(
+    times: np.ndarray,
+    values: np.ndarray,
+) -> float:
+    if len(times) < 2:
+        return 0.0
+
+    slopes: list[float] = []
+
+    for i in range(len(times) - 1):
+        dt = times[i + 1:] - times[i]
+        dy = values[i + 1:] - values[i]
+
+        valid = np.isfinite(dt) & np.isfinite(dy) & (dt != 0)
+
+        if np.any(valid):
+            slopes.extend(
+                (dy[valid] / dt[valid]).tolist()
+            )
+
+    return (
+        float(np.median(slopes))
+        if slopes
+        else 0.0
+    )
+
+
+def _time_features(
+    times: np.ndarray,
+    values: np.ndarray,
+    alpha: float,
+    cusum_drift: float,
+    cusum_threshold: float,
+) -> pd.DataFrame:
+    count = len(values)
+
+    delta = np.zeros(count, dtype=float)
+    slope = np.zeros(count, dtype=float)
+    acceleration = np.zeros(count, dtype=float)
+    ewma_shift = np.zeros(count, dtype=float)
+    cusum = np.zeros(count, dtype=float)
+    change_point = np.zeros(count, dtype=bool)
+
+    if count == 0:
+        return pd.DataFrame()
+
+    ewma = float(values[0])
+    previous_slope = 0.0
+    positive = 0.0
+    negative = 0.0
+
+    global_mad = robust_mad(values)
+
+    for i in range(count):
+        if i > 0:
+            dt = times[i] - times[i - 1]
+
+            if dt != 0:
+                delta[i] = values[i] - values[i - 1]
+                slope[i] = delta[i] / dt
+
+                if i > 1:
+                    acceleration[i] = (
+                        slope[i] - previous_slope
+                    ) / dt
+
+            ewma = (
+                alpha * values[i]
+                + (1.0 - alpha) * ewma
+            )
+
+        ewma_shift[i] = values[i] - ewma
+        previous_slope = slope[i]
+
+        z = (
+            (values[i] - np.median(values))
+            / max(global_mad, 1e-9)
+        )
+
+        positive = max(
+            0.0,
+            positive + z - cusum_drift,
+        )
+
+        negative = min(
+            0.0,
+            negative + z + cusum_drift,
+        )
+
+        cusum[i] = max(
+            positive,
+            abs(negative),
+        )
+
+        change_point[i] = (
+            cusum[i] >= cusum_threshold
+        )
+
+    return pd.DataFrame(
+        {
+            "delta": delta,
+            "slope": slope,
+            "acceleration": acceleration,
+            "ewma_shift": ewma_shift,
+            "cusum": cusum,
+            "change_point": change_point,
+        }
+    )
+
+
+def _limit_values(
+    parameter: str,
+    parameter_config: Mapping[str, Any],
+) -> tuple[float | None, float | None, float | None, float | None]:
+    spec = parameter_config.get(
+        "parameters",
+        {},
+    ).get(parameter, {})
+
+    engineering = spec.get(
+        "engineering_limit",
+        {},
+    )
+
+    warning = spec.get(
+        "warning_limit",
+        {},
+    )
+
+    return (
+        engineering.get("lower"),
+        engineering.get("upper"),
+        warning.get("lower"),
+        warning.get("upper"),
+    )
+
+
+def _signed_distance(
+    value: float,
+    lower: float | None,
+    upper: float | None,
+) -> float:
+    if lower is not None and value < lower:
+        return value - lower
+
+    if upper is not None and value > upper:
+        return value - upper
+
+    distances: list[float] = []
+
+    if lower is not None:
+        distances.append(value - lower)
+
+    if upper is not None:
+        distances.append(upper - value)
+
+    return (
+        float(min(distances))
+        if distances
+        else float("nan")
+    )
+
+
+def _warning_distance(
+    value: float,
+    lower: float | None,
+    upper: float | None,
+) -> float:
+    return _signed_distance(
+        value,
+        lower,
+        upper,
+    )
+
+
+def add_features(
+    canonical: pd.DataFrame,
+    parameter_config: Mapping[str, Any],
+    config: FeatureConfig | None = None,
+) -> pd.DataFrame:
+    if config is None:
+        config = FeatureConfig()
+
+    if canonical.empty:
+        return canonical.copy()
+
+    required = {
+        "component_id",
+        "parameter",
+        "value",
+        "time_h",
+    }
+
+    missing = required - set(canonical.columns)
+
     if missing:
-        raise ValueError("Canonical dataset is missing required columns: " + ", ".join(missing))
+        raise ValueError(
+            f"Missing feature columns: {sorted(missing)}"
+        )
 
-class FeatureEngine:
-    """Builds universal screening features from canonical observations."""
+    frame = canonical.copy()
 
-    def __init__(self, parameter_config: Mapping[str, object] | None = None):
-        self.parameter_specs: dict[str, Mapping[str, object]] = {}
-        if parameter_config is not None:
-            self.parameter_specs = {str(k): v for k, v in parameter_config.get("parameters", {}).items()}
+    for field in ["lot_id", "batch_id", "family"]:
+        if field not in frame.columns:
+            frame[field] = ""
 
-    @classmethod
-    def from_project_config(cls) -> "FeatureEngine":
-        return cls(_project_configs()["parameters"])
+        frame[field] = (
+            frame[field]
+            .fillna("")
+            .astype(str)
+        )
 
-    def _scoped_keys(self, df: pd.DataFrame, include_stage: bool = True) -> list[str]:
-        keys = []
-        for k in ("lot_id", "component_family", "parameter", "time_h"):
-            if k in df.columns and df[k].notna().any(): keys.append(k)
-        if include_stage and "test_stage" in df.columns and df[k].notna().any(): keys.append("test_stage")
-        for k in ("test_method", "stress_mode"):
-            if k in df.columns and df[k].notna().any(): keys.append(k)
-        return keys
+    frame["value"] = pd.to_numeric(
+        frame["value"],
+        errors="coerce",
+    )
 
-    def _population_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
-        out["value"] = _finite_series(out["value"])
-        eligible = out["parameter"].notna() & out["value"].notna()
+    frame["time_h"] = pd.to_numeric(
+        frame["time_h"],
+        errors="coerce",
+    )
 
-        feature_names = [
-            "lot_count", "lot_mean", "lot_std", "lot_min", "lot_max", "lot_median",
-            "lot_mad", "lot_iqr", "lot_relative_deviation", "lot_relative_percent",
-            "lot_robust_z", "lot_z", "lot_percentile", "directional_lot_deviation",
-            "directional_lot_robust_z",
-        ]
-        for name in feature_names: out[name] = np.nan
+    frame = frame.sort_values(
+        [
+            "component_id",
+            "parameter",
+            "time_h",
+        ],
+        kind="stable",
+    )
 
-        if not eligible.any(): return out
+    records: list[dict[str, Any]] = []
 
-        work = out.loc[eligible].drop(columns=feature_names).copy()
-        keys = self._scoped_keys(work)
-        grp = work.groupby(keys, dropna=False, sort=False)["value"]
-        stats = grp.agg(lot_count="count", lot_mean="mean", lot_std="std", lot_min="min", lot_max="max", lot_median="median")
-        merged = pd.concat([stats, grp.agg(_mad).rename("lot_mad"), grp.agg(_iqr).rename("lot_iqr")], axis=1).reset_index()
-        work = work.merge(merged, on=keys, how="left", sort=False)
+    for (component_id, parameter), group in frame.groupby(
+        ["component_id", "parameter"],
+        sort=False,
+    ):
+        group = group.sort_values("time_h")
+        times = group["time_h"].to_numpy(dtype=float)
+        values = group["value"].to_numpy(dtype=float)
 
-        work["lot_relative_deviation"] = work["value"] - work["lot_median"]
-        work["lot_relative_percent"] = _safe_div(work["lot_relative_deviation"], work["lot_median"].abs()) * 100.0
-        robust_scale = 1.4826 * work["lot_mad"]
-        work["lot_robust_z"] = _safe_div(work["lot_relative_deviation"], robust_scale)
-        work["lot_z"] = _safe_div(work["value"] - work["lot_mean"], work["lot_std"])
-        work["lot_percentile"] = work.groupby(keys, dropna=False, sort=False)["value"].transform(_percentile_rank)
+        valid = (
+            np.isfinite(times)
+            & np.isfinite(values)
+        )
 
-        direction = work["parameter"].astype("string").map(lambda p: _direction_factor(self.parameter_specs.get(str(p), {}).get("directionality"))).astype(float)
-        work["directional_lot_deviation"] = work["lot_relative_deviation"] * direction.to_numpy()
-        work["directional_lot_robust_z"] = work["lot_robust_z"] * direction.to_numpy()
+        times = times[valid]
+        values = values[valid]
 
-        if "observation_id" in out.columns:
-            derived = work[["observation_id", *feature_names]].drop_duplicates("observation_id", keep="first")
-            out = out.drop(columns=feature_names).merge(derived, on="observation_id", how="left", sort=False)
-        else:
-            out.loc[work.index, feature_names] = work[feature_names].to_numpy()
-        return out
+        temporal = _time_features(
+            times,
+            values,
+            alpha=config.ewma_alpha,
+            cusum_drift=config.cusum_drift,
+            cusum_threshold=config.cusum_threshold,
+        )
 
-    @staticmethod
-    def _temporal_features_vectorized(df: pd.DataFrame) -> pd.DataFrame:
-        g = df.copy()
-        keys = ["part_id", "parameter"]
-        for k in ("test_stage", "test_method", "stress_mode"):
-            if k in g.columns and g[k].notna().any(): keys.append(k)
+        valid_indices = group.index[valid].tolist()
 
-        g["_time_num"] = pd.to_numeric(g["time_h"], errors="coerce")
-        if "forecast_origin_h" in g.columns:
-            g = g[g["_time_num"] <= pd.to_numeric(g["forecast_origin_h"], errors="coerce")].copy()
-            
-        g["_value_num"] = _finite_series(g["value"])
-        sort_cols = keys + ["_time_num"]
-        if "source_row_number" in g.columns: sort_cols.append("source_row_number")
-        g = g.sort_values(sort_cols, kind="stable").copy()
-        grouped = g.groupby(keys, dropna=False, sort=False)
+        for position, source_index in enumerate(valid_indices):
+            row = group.loc[source_index]
 
-        prev_time = grouped["_time_num"].shift(1)
-        prev_value = grouped["_value_num"].shift(1)
-        dt = g["_time_num"] - prev_time
-        valid_pair = g["_time_num"].notna() & g["_value_num"].notna() & prev_time.notna() & prev_value.notna() & dt.ne(0)
+            value = float(
+                row["value"]
+            )
 
-        g["temporal_delta"] = (g["_value_num"] - prev_value).where(valid_pair)
-        g["temporal_slope"] = (g["temporal_delta"] / dt.where(valid_pair)).where(valid_pair)
-        g["normalized_drift"] = (g["temporal_delta"] / prev_value.abs().where(valid_pair)).where(valid_pair)
+            reference_median, reference_mad, reference_level = (
+                _reference_for_row(
+                    frame,
+                    row,
+                    str(parameter),
+                    config,
+                )
+            )
 
-        prev_slope = grouped["temporal_slope"].shift(1)
-        slope_valid = g["temporal_slope"].notna() & prev_slope.notna() & dt.ne(0)
-        g["temporal_acceleration"] = ((g["temporal_slope"] - prev_slope) / dt.where(slope_valid)).where(slope_valid)
-        g["temporal_curvature"] = (g["temporal_slope"] - prev_slope).where(slope_valid)
-        cp_denom = g["temporal_slope"].abs() + prev_slope.abs() + 1e-15
-        g["change_point_indicator"] = ((g["temporal_curvature"].abs() / cp_denom) >= 0.25).astype("int8")
+            robust_z = (
+                abs(value - reference_median)
+                / max(reference_mad, config.mad_epsilon)
+                if np.isfinite(reference_median)
+                else np.nan
+            )
 
-        g["trajectory_deviation"] = g.get("lot_relative_deviation", pd.Series(np.nan, index=g.index))
+            lower, upper, warning_lower, warning_upper = _limit_values(
+                str(parameter),
+                parameter_config,
+            )
 
-        valid_values = g["_value_num"].notna() & g["_time_num"].notna()
-        valid_value = g["_value_num"].where(valid_values)
-        valid_time = g["_time_num"].where(valid_values)
-        first_value = valid_value.groupby([g[k] for k in keys], dropna=False, sort=False).transform("first")
-        last_value = valid_value.groupby([g[k] for k in keys], dropna=False, sort=False).transform("last")
-        first_time = valid_time.groupby([g[k] for k in keys], dropna=False, sort=False).transform("min")
-        last_time = valid_time.groupby([g[k] for k in keys], dropna=False, sort=False).transform("max")
+            distance_to_limit = _signed_distance(
+                value,
+                lower,
+                upper,
+            )
 
-        g["observed_readpoint_count"] = valid_value.groupby([g[k] for k in keys], dropna=False, sort=False).transform("count").fillna(0).astype("int64")
-        total_dt = last_time - first_time
-        total_change = last_value - first_value
-        g["trajectory_overall_slope"] = (total_change / total_dt.where(total_dt.abs() > 1e-15)).where(total_dt.abs() > 1e-15)
-        g["trajectory_total_normalized_drift"] = (total_change / first_value.abs().where(first_value.abs() > 1e-15)).where(first_value.abs() > 1e-15)
-        g["time_span_h"] = total_dt.fillna(0.0)
+            distance_to_warning = _warning_distance(
+                value,
+                warning_lower,
+                warning_upper,
+            )
 
-        denom = g["temporal_slope"].abs() + prev_slope.abs() + 1e-15
-        g["trajectory_change_point_score"] = (((g["temporal_slope"] - prev_slope).abs() / denom).clip(upper=1.0).where(slope_valid))
+            current_slope = float(
+                temporal.loc[position, "slope"]
+            )
 
-        if "directional_lot_robust_z" in g.columns:
-            rz = pd.to_numeric(g["directional_lot_robust_z"], errors="coerce")
-            z_group = rz.groupby([g[k] for k in keys], dropna=False, sort=False)
-            g["trajectory_abs_robust_z_max"] = z_group.transform("max", numeric_only=False).abs()
-            z_sq = rz.pow(2)
-            z_sq_group = z_sq.groupby([g[k] for k in keys], dropna=False, sort=False)
-            g["trajectory_abs_robust_z_rms"] = np.sqrt(z_sq_group.transform("sum") / z_sq_group.transform("count").where(z_sq_group.transform("count") > 0))
-        else:
-            g["trajectory_abs_robust_z_max"] = np.nan
-            g["trajectory_abs_robust_z_rms"] = np.nan
+            if upper is not None:
+                approach = max(
+                    0.0,
+                    current_slope,
+                )
+            elif lower is not None:
+                approach = max(
+                    0.0,
+                    -current_slope,
+                )
+            else:
+                approach = abs(current_slope)
 
-        g.drop(columns=["_time_num", "_value_num"], inplace=True)
-        return g
+            near_warning = False
 
-    def _temporal_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        result = self._temporal_features_vectorized(df)
-        order_cols = [c for c in ("part_id", "parameter", "time_h", "source_row_number") if c in result.columns]
-        if order_cols: result = result.sort_values(order_cols, kind="stable").reset_index(drop=True)
+            if warning_upper is not None:
+                near_warning |= value >= warning_upper
+
+            if warning_lower is not None:
+                near_warning |= value <= warning_lower
+
+            records.append(
+                {
+                    "component_id": component_id,
+                    "parameter": parameter,
+                    "lot_id": str(row.get("lot_id", "")),
+                    "batch_id": str(row.get("batch_id", "")),
+                    "family": str(row.get("family", "")),
+                    "time_h": float(row["time_h"]),
+                    "value": value,
+                    "unit": row.get("unit", ""),
+                    "reference_level": reference_level,
+                    "reference_median": reference_median,
+                    "reference_mad": reference_mad,
+                    "robust_z": robust_z,
+                    "delta": float(
+                        temporal.loc[position, "delta"]
+                    ),
+                    "slope": current_slope,
+                    "acceleration": float(
+                        temporal.loc[position, "acceleration"]
+                    ),
+                    "ewma_shift": float(
+                        temporal.loc[position, "ewma_shift"]
+                    ),
+                    "cusum": float(
+                        temporal.loc[position, "cusum"]
+                    ),
+                    "change_point": bool(
+                        temporal.loc[position, "change_point"]
+                    ),
+                    "distance_to_limit": distance_to_limit,
+                    "distance_to_warning": distance_to_warning,
+                    "rate_of_approach_to_limit": approach,
+                    "near_warning": near_warning,
+                    "lower_limit": lower,
+                    "upper_limit": upper,
+                    "warning_lower": warning_lower,
+                    "warning_upper": warning_upper,
+                    "source_index": source_index,
+                }
+            )
+
+    result = pd.DataFrame(records)
+
+    if result.empty:
         return result
 
-    @staticmethod
-    def _context_features(df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
-        for col in ("component_family", "component_type", "parameter", "semantic_type", "physical_quantity", "test_stage", "test_method", "stress_mode", "unit"):
-            if col in out.columns: out[f"context_{col}_code"] = _stable_category_code(out[col])
-        for col in ("temperature_C", "burnin_temperature_C", "voltage_V", "current_A", "time_h"):
-            if col in out.columns:
-                out[f"context_{col}_missing"] = out[col].isna().astype("int8")
-                out[col] = _finite_series(out[col])
-        if {"temperature_C", "burnin_temperature_C"}.issubset(out.columns): out["context_temperature_offset_C"] = out["temperature_C"] - out["burnin_temperature_C"]
-        if {"voltage_V", "current_A"}.issubset(out.columns): out["context_apparent_power_W"] = out["voltage_V"] * out["current_A"]
-        return out
+    result["mad_deviation"] = (
+        result["value"]
+        - result["reference_median"]
+    ).abs()
 
-    @staticmethod
-    def _quality_features(df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
-        value_missing = _finite_series(out["value"]).isna()
-        if "measurement_status" in out.columns:
-            status = out["measurement_status"].astype("string").str.upper()
-            status_missing = status.isin(["MISSING", "FAILED_TEST", "BELOW_DETECTION", "CENSORED"])
-            out["quality_is_missing"] = (value_missing | status_missing).astype("int8")
-            out["quality_is_valid"] = (status.eq("VALID") & ~value_missing).astype("int8")
-        else:
-            out["quality_is_valid"] = (~value_missing).astype("int8")
-            out["quality_is_missing"] = value_missing.astype("int8")
+    result["iqr_deviation"] = (
+        result
+        .groupby("parameter")["value"]
+        .transform(
+            lambda series: (
+                (series - series.median()).abs()
+                / max(
+                    float(
+                        series.quantile(0.75)
+                        - series.quantile(0.25)
+                    ),
+                    config.mad_epsilon,
+                )
+            )
+        )
+    )
 
-        censor = out.get("censoring", pd.Series("NONE", index=out.index)).astype("string").str.upper()
-        out["quality_is_censored"] = (~censor.isin(["NONE", "NAN", "", "<NA>"])).astype("int8")
-        out["quality_censor_direction"] = censor.map({"GT": 1, "GE": 1, "LT": -1, "LE": -1}).fillna(0).astype("int8")
-        # Repeatability/measurement stability features. Duplicate samples at the same
-        # part-parameter-time are retained; these summaries quantify their spread.
-        repeat_keys=[k for k in ["part_id","parameter","time_h"] if k in out.columns]
-        if repeat_keys:
-            vg=_finite_series(out["value"]).groupby([out[k] for k in repeat_keys], dropna=False, sort=False)
-            out["repeat_count"]=vg.transform("count").fillna(0).astype("int64")
-            out["repeat_mean"]=vg.transform("mean")
-            out["repeat_std"]=vg.transform("std").fillna(0.0)
-            out["repeat_range"]=vg.transform(lambda x: x.max()-x.min())
-            out["repeat_cv_percent"]=(100.0*out["repeat_std"].abs()/out["repeat_mean"].abs().replace(0,np.nan)).fillna(0.0)
-        else:
-            out["repeat_count"]=1
-            out["repeat_mean"]=_finite_series(out["value"])
-            out["repeat_std"]=0.0
-            out["repeat_range"]=0.0
-            out["repeat_cv_percent"]=0.0
-
-        qflag = out.get("quality_flag", pd.Series("VALID", index=out.index)).astype("string").str.upper()
-        out["quality_flag_code"] = qflag.map({"VALID": 0, "LIMITED": 1, "ERROR": 2}).fillna(3).astype("int8")
-
-        score = 1.0 - 0.45 * out["quality_is_missing"].astype(float) - 0.20 * out["quality_is_censored"].astype(float) - 0.15 * (out["quality_flag_code"] >= 1).astype(float)
-        out["measurement_quality_score"] = score.clip(lower=0.0, upper=1.0)
-        return out
-
-    def build(self, canonical: pd.DataFrame) -> pd.DataFrame:
-        # Autonomous safety: fill missing required context so grouping doesn't drop rows
-        df = canonical.copy()
-        df["lot_id"] = df.get("lot_id", pd.Series("UNKNOWN_LOT", index=df.index)).fillna("UNKNOWN_LOT")
-        df["component_family"] = df.get("component_family", pd.Series("UNKNOWN_FAMILY", index=df.index)).fillna("UNKNOWN_FAMILY")
-        _validate_canonical_frame(df)
-        
-        df["value"] = _finite_series(df["value"])
-        df = self._population_features(df)
-        df = self._temporal_features(df)
-        df = self._context_features(df)
-        df = self._quality_features(df)
-
-        priority = [
-            "observation_id", "part_id", "lot_id", "component_family", "parameter", "value", "unit", "time_h",
-            "lot_median", "lot_mad", "lot_robust_z", "temporal_delta", "temporal_slope",
-            "temporal_acceleration", "measurement_quality_score",
+    return result.sort_values(
+        [
+            "component_id",
+            "parameter",
+            "time_h",
         ]
-        ordered = [c for c in priority if c in df.columns]
-        ordered += [c for c in df.columns if c not in ordered]
-        return df[ordered].reset_index(drop=True)
-
-def validate_features(df: pd.DataFrame) -> tuple[bool, list[str]]:
-    errors = []
-    _validate_canonical_frame(df)
-    for col in ["lot_robust_z", "lot_relative_deviation", "temporal_slope", "measurement_quality_score"]:
-        if col not in df.columns: errors.append(f"missing_feature:{col}")
-    if df.columns.duplicated().any(): errors.append("duplicate_feature_columns")
-    return len(errors) == 0, errors
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("build-canonical")
-    p.add_argument("input")
-    p.add_argument("output")
-    args = parser.parse_args()
-    if args.cmd == "build-canonical":
-        df = pd.read_csv(args.input, low_memory=False)
-        result = FeatureEngine.from_project_config().build(df)
-        result.to_csv(args.output, index=False)
-        return 0
-    return 1
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
-
-
-def feature_availability_manifest(df: pd.DataFrame, as_of_h: float = 24.0) -> dict[str, Any]:
-    """Return a deterministic record of history-dependent feature availability."""
-    if "time_h" not in df.columns or "part_id" not in df.columns:
-        return {"as_of_h": float(as_of_h), "status": "UNKNOWN", "readpoint_distribution": {}}
-    times = pd.to_numeric(df["time_h"], errors="coerce")
-    counts = df.loc[times <= float(as_of_h)].groupby("part_id")["time_h"].nunique() if len(df) else pd.Series(dtype=int)
-    n2 = int((counts >= 2).sum()); n3 = int((counts >= 3).sum()); n8 = int((counts >= 8).sum())
-    return {
-        "as_of_h": float(as_of_h),
-        "parts": int(counts.size),
-        "parts_with_2plus_readpoints": n2,
-        "parts_with_3plus_readpoints": n3,
-        "parts_with_8plus_readpoints": n8,
-        "feature_rules": {
-            "baseline_and_population": "1+ observed readpoint",
-            "slope": "2+ observed readpoints",
-            "acceleration_curvature_change_point": "3+ observed readpoints",
-            "advanced_temporal_model": "8+ observed readpoints",
-        },
-    }
+    ).reset_index(drop=True)

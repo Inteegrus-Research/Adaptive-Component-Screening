@@ -1,134 +1,74 @@
-schema_version: '1.0'
-decision_states:
-  allowed:
-  - SAFE
-  - REVIEW
-  - REJECT
-  - UNKNOWN
-  precedence:
-  - REJECT
-  - UNKNOWN
-  - REVIEW
-  - SAFE
-objective:
-  primary: minimize_catastrophic_false_negatives
-  secondary: control_false_positive_rejection
-  forbid_trivial_all_reject_solution: true
-  require_operational_constraint: true
-costs:
-  false_negative: 100.0
-  false_positive: 1.0
-  uncertain_decision: 0.25
-  data_quality_failure: 10.0
-  ood_misclassification: 50.0
-  costs_are_tunable: true
-  values_are_initial_assumptions: true
-hard_limit_policy:
-  enabled: true
-  source_priority:
-  - incoming_authoritative_specification
-  - validated_screening_profile
-  - approved_component_profile
-  - generic_config_fallback
-  generic_config_fallback_allowed: false
-  absolute_violation_action: REJECT
-  near_limit_requires_uncertainty_check: true
-  near_limit_fraction: 0.95
-risk_score:
-  scale_min: 0.0
-  scale_max: 1.0
-  interpretation: calibrated risk estimate, not probability unless calibration is
-    demonstrated
-  thresholds:
-    safe_max: 0.35
-    review_max: 0.6
-    reject_min: 0.6
-  thresholds_are_initial_software_defaults: true
-  must_be_selected_on_validation_data: true
-  selection_objective:
-    primary: minimum_false_negative_rate
-    constraint: acceptable_false_positive_rate
-  evidence_thresholds:
-    high_channel_min: 0.6
-    joint_high_min: 0.6
-uncertainty:
-  enabled: true
-  high_uncertainty_action: REVIEW
-  insufficient_evidence_action: UNKNOWN
-  prediction_interval:
-    required_for_future_value_decision: true
-    minimum_coverage_target: 0.9
-  anomaly_calibration_required: true
+thresholds:
+  max_target_fpr: 0.05
+
+  risk_reject_threshold: 0.75
+  risk_review_threshold: 0.40
+
+  ood_novelty_threshold: 0.70
+  max_uncertainty_threshold: 0.65
+
+  anomaly_review_threshold: 0.60
+  rapid_degradation_threshold: 0.60
+
+  crossing_confidence_threshold: 0.80
+
+fallbacks:
+  DEGRADED:
+    no_forecast: REVIEW
+    insufficient_reference: REVIEW
+    high_uncertainty: REVIEW
+    missing_engineering_limit: REVIEW
+    default: REVIEW
+
+  COLD_START:
+    low_risk: PASS
+    moderate_risk: REVIEW
+    high_risk: REVIEW
+    predicted_crossing_high_confidence: REJECT
+    high_ood: UNKNOWN
+    default: REVIEW
+
+  INSUFFICIENT:
+    default: UNKNOWN
+
+  UNKNOWN:
+    default: UNKNOWN
+
 ood:
-  enabled: true
-  severe_ood_action: REVIEW
-  unknown_semantics_action: UNKNOWN
-  component_family_unseen_action: REVIEW
-  stress_regime_unseen_action: REVIEW
-  ood_never_silent: true
-  dataset_status:
-    severe_part_fraction_min: 0.05
-    moderate_part_fraction_min: 0.1
-data_quality:
-  minimum_rows: 1
-  minimum_parts: 1
-  maximum_missing_fraction: 0.4
-  maximum_duplicate_fraction: 0.01
-  require_part_identifier: true
-  require_parameter_identifier: true
-  require_value_or_censoring: true
-  invalid_unit_action: UNKNOWN
-  unresolved_semantic_mapping_action: UNKNOWN
-  malformed_timestamps_action: UNKNOWN
-minimum_evidence:
-  anomaly:
-    minimum_lot_size: 20
-    minimum_population_reference: 10
-    otherwise_action: UNKNOWN
-  forecast:
-    minimum_observed_readpoints: 2
-    minimum_future_separation_h: 1.0
-    otherwise_action: UNKNOWN
-  decision:
-    require_anomaly_or_forecast_evidence: true
-    require_data_quality_pass: true
-review_triggers:
-  any:
-  - moderate_anomaly_score
-  - prediction_interval_crosses_limit
-  - severe_ood
-  - high_missingness
-  - conflicting_module_outputs
-  - uncertain_policy_threshold
-reject_triggers:
-  any:
-  - absolute_hard_limit_violation
-  - calibrated_high_failure_risk
-  - calibrated_high_anomaly_risk_with_supporting_evidence
-safety_override:
-  enabled: true
-  rules:
-    absolute_hard_limit_violation: REJECT
-    unknown_parameter_semantics: UNKNOWN
-    insufficient_data: UNKNOWN
-    severe_data_corruption: UNKNOWN
-    severe_ood: REVIEW
-  cannot_be_overridden_by_model: true
-explainability:
-  required: true
-  minimum_reasons: 1
-  include:
-  - decision_state
-  - risk_score
-  - uncertainty
-  - absolute_limit_status
-  - lot_relative_evidence
-  - temporal_evidence
-  - forecast_evidence
-  - ood_status
-  - data_quality_status
-  human_readable: true
-confidence_thresholds:
-  high_uncertainty_max: 0.3
-  moderate_uncertainty_max: 0.7
-  low_quality_min: 0.6
+  min_reference_rows: 12
+  known_family_distance_quantile: 0.99
+  robust_scale_epsilon: 0.000001
+
+risk:
+  weights:
+    anomaly: 0.40
+    crossing: 0.30
+    acceleration: 0.20
+    proximity: 0.10
+
+  calibration:
+    slope: 4.0
+    intercept: -2.0
+
+forecast:
+  horizon_h: 168.0
+  min_component_points: 2
+  min_training_components: 4
+  min_training_rows: 24
+  conformal_alpha: 0.05
+  min_calibration_residuals: 8
+  cold_start_min_points_for_trend: 3
+  uncertainty_growth_per_sqrt_hour: 0.02
+
+features:
+  min_reference_group_size: 8
+  mad_epsilon: 0.000000001
+  ewma_alpha: 0.25
+  cusum_drift: 0.50
+  cusum_threshold: 2.50
+
+decision:
+  hard_limit_precedence: true
+  high_ood_blocks_risk_reject: true
+  high_uncertainty_blocks_risk_reject: true
+  ood_unknown_status: true

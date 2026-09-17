@@ -1,28 +1,21 @@
-"""Stable JSON contracts exposed by the application boundary.
-
-These models intentionally contain presentation-facing structure only. The
-scientific implementation remains in ``src/``.
-"""
 from __future__ import annotations
-
 from typing import Any, Literal
-
 from pydantic import BaseModel, ConfigDict, Field
 
 Decision = Literal["SAFE", "REVIEW", "REJECT", "UNKNOWN"]
-OODStatus = Literal["LOW", "MODERATE", "SEVERE", "UNKNOWN", "DEGRADED"]
-
 
 class APIModel(BaseModel):
     model_config = ConfigDict(extra="allow")
-
 
 class SystemStatus(APIModel):
     status: str
     pipeline: str = "READY"
     models: str = "AVAILABLE"
     demo_mode: bool = False
-
+    report_source: str | None = None
+    report_dir: str | None = None
+    integrity: str = "PASS"
+    api_version: str = "3.0.0"
 
 class BatchSummary(APIModel):
     total_components: int
@@ -34,7 +27,6 @@ class BatchSummary(APIModel):
     future_defects_detected: int | None = None
     report_source: str
 
-
 class ComponentSummary(APIModel):
     part_id: str
     lot_id: str | None = None
@@ -45,7 +37,7 @@ class ComponentSummary(APIModel):
     decision: Decision
     risk_score: float | None = None
     confidence: str | None = None
-    ood_status: OODStatus | str = "UNKNOWN"
+    ood_status: str = "UNKNOWN"
     ood_score: float | None = None
     anomaly_risk: float | None = None
     failure_risk: float | None = None
@@ -53,13 +45,11 @@ class ComponentSummary(APIModel):
     burnin_hours: float | None = None
     failure_mode: str | None = None
 
-
 class EvidenceChannel(APIModel):
     name: str
     score: float | None = None
     level: str | None = None
     detail: str | None = None
-
 
 class ForecastPayload(APIModel):
     horizon_h: float | None = None
@@ -75,11 +65,9 @@ class ForecastPayload(APIModel):
     safety_slope_excess: float | None = None
     model_predictions: dict[str, float | None] = Field(default_factory=dict)
 
-
 class MeasurementPoint(APIModel):
     time_h: float
     value: float | None = None
-
 
 class ComponentIntelligence(APIModel):
     component: ComponentSummary
@@ -93,15 +81,14 @@ class ComponentIntelligence(APIModel):
     explanation: dict[str, Any] = Field(default_factory=dict)
     audit_metadata: dict[str, Any] = Field(default_factory=dict)
 
-
 class ScreenResponse(APIModel):
+    run_id: str | None = None
     manifest: dict[str, Any]
     summary: BatchSummary
     decisions: list[dict[str, Any]]
     explanations: list[dict[str, Any]]
     components: list[ComponentSummary]
     component_intelligence: list[ComponentIntelligence] = Field(default_factory=list)
-
 
 class ContractResponse(APIModel):
     api_version: str

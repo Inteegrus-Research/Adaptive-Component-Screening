@@ -10,7 +10,7 @@ fastapi==0.128.2
 uvicorn==0.48.0
 python-multipart==0.0.29
 pytest==9.0.2
-
+httpx
 # Optional but recommended for tree-model attributions. The evidence-based explainer remains available if SHAP is unavailable.
 shap==0.50.0
 # Optional model-attribution dependency (not required for core screening):

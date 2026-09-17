@@ -1,341 +1,437 @@
-"""Read and assemble persisted pipeline results for the frontend API.
-
-No scientific calculations are performed here. This layer only joins the
-existing pipeline artifacts into a frontend-friendly representation.
-"""
+"""Read-only result service for the V4 consolidated ``triage.csv`` contract."""
 from __future__ import annotations
 
-import ast
+from dataclasses import asdict, is_dataclass
 import json
-import math
-import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from app.schemas import (
-    BatchSummary,
-    ComponentIntelligence,
-    ComponentSummary,
-    EvidenceChannel,
-    ForecastPayload,
-    MeasurementPoint,
-)
-from src.utils import PROJECT_ROOT
 
+class ResultsService:
+    """Serve persisted V4 screening reports to the application/frontend.
 
-REPORT_ENV = "ACS_RESULTS_DIR"
-DEFAULT_REPORT_DIR = PROJECT_ROOT / "reports" / ("demo_report" if (PROJECT_ROOT / "reports" / "demo_report" / "screening.csv").exists() else "demo_screen")
+    V4 intentionally consolidates anomaly evidence, forecasts, trust state and
+    final disposition into ``triage.csv``. This service never attempts to join
+    the old V3 ``screening.csv`` + ``anomaly.csv`` + ``forecast.csv`` contract.
+    """
 
+    def __init__(self, reports_root: str | Path = "reports/live_runs") -> None:
+        self.reports_root = Path(reports_root)
 
-def _clean(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, (np.generic,)):
-        value = value.item()
-    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-        return None
-    if isinstance(value, dict):
-        return {str(k): _clean(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_clean(v) for v in value]
-    return value
-
-
-def _record(row: pd.Series) -> dict[str, Any]:
-    return _clean(row.to_dict())
-
-
-def _parse_obj(value: Any) -> Any:
-    if isinstance(value, (dict, list)):
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        if is_dataclass(value):
+            return ResultsService._json_safe(asdict(value))
+        if isinstance(value, pd.DataFrame):
+            return ResultsService._json_safe(value.to_dict(orient="records"))
+        if isinstance(value, pd.Series):
+            return ResultsService._json_safe(value.to_dict())
+        if isinstance(value, dict):
+            return {str(k): ResultsService._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [ResultsService._json_safe(v) for v in value]
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, np.integer):
+            return int(value)
+        if isinstance(value, np.floating):
+            number = float(value)
+            return None if not np.isfinite(number) else number
+        if isinstance(value, np.bool_):
+            return bool(value)
+        if isinstance(value, float) and not np.isfinite(value):
+            return None
         return value
-    if not isinstance(value, str) or not value.strip():
-        return {}
-    text = value.strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        try:
-            return ast.literal_eval(text)
-        except Exception:
-            return {}
 
+    @staticmethod
+    def _normalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
+        d = frame.copy()
 
-def _float(value: Any) -> float | None:
-    try:
-        x = float(value)
-        return x if math.isfinite(x) else None
-    except Exception:
-        return None
+        aliases = {
+            "component_id": "part_id",
+            "family": "component_family",
+            "disposition": "decision",
+            "failure_risk": "risk_score",
+            "anomaly_score": "anomaly_risk",
+            "predicted_value_at_horizon": "prediction_168h",
+        }
 
+        for target, source in aliases.items():
+            if target in d.columns and source not in d.columns:
+                d[source] = d[target]
 
-def _first_non_null(*values: Any) -> Any:
-    for value in values:
-        if value is not None and not (isinstance(value, float) and math.isnan(value)):
-            if str(value) not in {"", "nan", "None"}:
-                return value
-    return None
+        if "prediction_168h" not in d.columns:
+            for column in [
+                "predicted_value_at_horizon",
+                "prediction_168h",
+            ]:
+                if column in d.columns:
+                    d["prediction_168h"] = d[column]
+                    break
 
+        if "risk_score" not in d.columns:
+            if "failure_risk" in d.columns:
+                d["risk_score"] = d["failure_risk"]
+            else:
+                d["risk_score"] = np.nan
 
-def _decision(value: Any) -> str:
-    return str(value).upper() if value is not None else "UNKNOWN"
+        if "decision" not in d.columns and "disposition" in d.columns:
+            d["decision"] = d["disposition"]
 
+        if "confidence" not in d.columns:
+            if "forecast_confidence" in d.columns:
+                d["confidence"] = pd.to_numeric(
+                    d["forecast_confidence"],
+                    errors="coerce",
+                )
+            else:
+                d["confidence"] = np.nan
 
-def _trace(screen_row: pd.Series) -> dict[str, Any]:
-    trace = _parse_obj(screen_row.get("trace"))
-    return trace if isinstance(trace, dict) else {}
+        return d
 
+    def _run_dirs(self) -> list[Path]:
+        if not self.reports_root.exists():
+            return []
 
-def _row_for_part(df: pd.DataFrame, part_id: str, parameter: str | None = None) -> pd.Series | None:
-    if df.empty or "part_id" not in df.columns:
-        return None
-    rows = df[df["part_id"].astype(str).eq(str(part_id))]
-    if rows.empty:
-        return None
-    if parameter and "parameter" in rows.columns:
-        exact = rows[rows["parameter"].astype(str).eq(str(parameter))]
-        if not exact.empty:
-            return exact.iloc[0]
-    return rows.iloc[0]
+        return sorted(
+            [
+                path
+                for path in self.reports_root.iterdir()
+                if path.is_dir()
+                and (path / "triage.csv").exists()
+            ],
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
 
+    def resolve_run(self, run_id: str | None = None) -> Path:
+        if run_id:
+            candidate = self.reports_root / str(run_id)
+            if not candidate.is_dir():
+                raise FileNotFoundError(
+                    f"Run {run_id!r} does not exist."
+                )
+            if not (candidate / "triage.csv").exists():
+                raise FileNotFoundError(
+                    f"Run {run_id!r} has no triage.csv."
+                )
+            return candidate
 
-@dataclass
-class ResultsRepository:
-    report_dir: Path
+        runs = self._run_dirs()
+        if not runs:
+            raise FileNotFoundError(
+                f"No V4 reports with triage.csv found under {self.reports_root}."
+            )
+        return runs[0]
 
-    @classmethod
-    def from_environment(cls) -> "ResultsRepository":
-        raw = os.getenv(REPORT_ENV)
-        path = Path(raw).expanduser() if raw else DEFAULT_REPORT_DIR
-        if not path.is_absolute():
-            path = PROJECT_ROOT / path
-        return cls(path.resolve())
+    def _load_triage(self, run_id: str | None = None) -> tuple[Path, pd.DataFrame]:
+        run_dir = self.resolve_run(run_id)
+        frame = pd.read_csv(
+            run_dir / "triage.csv",
+            low_memory=False,
+        )
+        return run_dir, self._normalize_columns(frame)
 
-    def _csv(self, name: str) -> pd.DataFrame:
-        path = self.report_dir / name
+    def _load_canonical(self, run_dir: Path) -> pd.DataFrame:
+        path = run_dir / "canonical_telemetry.csv"
         if not path.exists():
             return pd.DataFrame()
         return pd.read_csv(path, low_memory=False)
 
-    @property
-    def screening(self) -> pd.DataFrame:
-        return self._csv("screening.csv")
+    def _load_features(self, run_dir: Path) -> pd.DataFrame:
+        path = run_dir / "features.csv"
+        if not path.exists():
+            return pd.DataFrame()
+        return pd.read_csv(path, low_memory=False)
 
-    @property
-    def anomaly(self) -> pd.DataFrame:
-        return self._csv("anomaly.csv")
-
-    @property
-    def forecast(self) -> pd.DataFrame:
-        return self._csv("forecast.csv")
-
-    @property
-    def canonical(self) -> pd.DataFrame:
-        return self._csv("canonical.csv")
-
-    @property
-    def raw(self) -> pd.DataFrame:
-        return self._csv("input.csv")
-
-    @property
-    def explanations(self) -> pd.DataFrame:
-        return self._csv("explanations.csv")
-
-    def available(self) -> bool:
-        return (self.report_dir / "screening.csv").exists()
-
-    def source_label(self) -> str:
-        if self.report_dir == DEFAULT_REPORT_DIR:
-            return "bundled_demo_results"
-        return str(self.report_dir)
-
-    def summary(self) -> BatchSummary:
-        df = self.screening
-        if df.empty or "part_id" not in df.columns:
-            return BatchSummary(
-                total_components=0,
-                safe=0,
-                review=0,
-                reject=0,
-                unknown=0,
-                decision_counts={},
-                report_source=self.source_label(),
-            )
-        decisions = df["decision"].map(_decision)
-        counts = decisions.value_counts(dropna=False).to_dict()
-        total = int(df["part_id"].astype(str).nunique())
-        # Persisted screening does not contain ground-truth future-failure labels.
-        # Do not present a forecast flag as a detected future defect. Benchmark
-        # ground truth remains a separate audit artifact.
-        future_detected = None
-        return BatchSummary(
-            total_components=total,
-            safe=int(counts.get("SAFE", 0)),
-            review=int(counts.get("REVIEW", 0)),
-            reject=int(counts.get("REJECT", 0)),
-            unknown=int(counts.get("UNKNOWN", 0)),
-            decision_counts={str(k): int(v) for k, v in counts.items()},
-            future_defects_detected=future_detected,
-            report_source=self.source_label(),
-        )
-
-    def components(self) -> list[ComponentSummary]:
-        screen = self.screening
-        if screen.empty:
-            return []
-        rows: list[ComponentSummary] = []
-        for _, srow in screen.iterrows():
-            trace = _trace(srow)
-            ma = trace.get("module_a", {}) if isinstance(trace, dict) else {}
-            mb = trace.get("module_b", {}) if isinstance(trace, dict) else {}
-            failure_mode = _first_non_null(srow.get("failure_mode"), mb.get("failure_mode"))
-            rows.append(
-                ComponentSummary(
-                    part_id=str(srow.get("part_id")),
-                    lot_id=_first_non_null(srow.get("lot_id"), ma.get("lot_id"), mb.get("lot_id")),
-                    component_family=_first_non_null(srow.get("component_family"), ma.get("component_family"), mb.get("component_family")),
-                    component_type=_first_non_null(srow.get("component_type"), srow.get("part_type"), mb.get("component_type")),
-                    parameter=_first_non_null(srow.get("parameter"), mb.get("parameter")),
-                    unit=_first_non_null(srow.get("unit"), mb.get("unit")),
-                    decision=_decision(srow.get("decision")),
-                    risk_score=_float(srow.get("risk_score")),
-                    confidence=str(srow.get("confidence")) if srow.get("confidence") is not None else None,
-                    ood_status=str(srow.get("ood_status")) if srow.get("ood_status") is not None else "UNKNOWN",
-                    ood_score=_float(srow.get("ood_score")),
-                    anomaly_risk=_float(srow.get("anomaly_risk")),
-                    failure_risk=_float(srow.get("failure_risk")),
-                    uncertainty_score=_float(srow.get("uncertainty_score")),
-                    burnin_hours=_float(mb.get("forecast_origin_h")),
-                    failure_mode=str(failure_mode) if failure_mode is not None else None,
+    def _load_explanations(self, run_dir: Path) -> list[dict[str, Any]]:
+        path = run_dir / "explanations.json"
+        if path.exists():
+            try:
+                payload = json.loads(
+                    path.read_text(encoding="utf-8")
                 )
+                return payload if isinstance(payload, list) else []
+            except json.JSONDecodeError:
+                return []
+
+        csv_path = run_dir / "explanations.csv"
+        if csv_path.exists():
+            return pd.read_csv(csv_path).to_dict(orient="records")
+
+        return []
+
+    def _load_json(self, run_dir: Path, name: str) -> dict[str, Any]:
+        path = run_dir / name
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(
+                path.read_text(encoding="utf-8")
             )
-        return rows
+            return payload if isinstance(payload, dict) else {}
+        except json.JSONDecodeError:
+            return {}
 
-    def intelligence(self, part_id: str) -> ComponentIntelligence:
-        screen = self.screening
-        row = _row_for_part(screen, part_id)
-        if row is None:
-            raise KeyError(part_id)
-        trace = _trace(row)
-        ma = trace.get("module_a", {}) if isinstance(trace, dict) else {}
-        mb = trace.get("module_b", {}) if isinstance(trace, dict) else {}
-        ood = trace.get("ood", {}) if isinstance(trace, dict) else {}
-        dq = trace.get("data_quality", {}) if isinstance(trace, dict) else {}
-        fusion = trace.get("fusion", {}) if isinstance(trace, dict) else {}
-        policy = trace.get("policy", {}) if isinstance(trace, dict) else {}
+    def summary(self, run_id: str | None = None) -> dict[str, Any]:
+        run_dir, triage = self._load_triage(run_id)
 
-        parameter = _first_non_null(mb.get("parameter"), ma.get("parameter"), row.get("parameter"))
-        unit = _first_non_null(mb.get("unit"), row.get("unit"))
-        fr = _row_for_part(self.forecast, part_id, parameter)
-        er = _row_for_part(self.explanations, part_id)
-
-        explanation = _record(er) if er is not None else {}
-        if er is not None:
-            for source, target in {
-                "facts": "facts",
-                "model_findings": "model_findings",
-                "policy_reasoning": "policy_reasoning",
-                "counterfactuals": "counterfactuals",
-                "top_reasons": "top_reasons",
-                "pattern_attribution_json": "pattern_attribution",
-                "audit_trace_json": "audit_trace",
-            }.items():
-                if source in er.index:
-                    explanation[target] = _parse_obj(er.get(source))
-
-        trajectory: list[MeasurementPoint] = []
-        can = self.canonical
-        if not can.empty and "part_id" in can.columns:
-            rows = can[can["part_id"].astype(str).eq(str(part_id))]
-            if parameter and "parameter" in rows.columns:
-                exact = rows[rows["parameter"].astype(str).eq(str(parameter))]
-                if not exact.empty:
-                    rows = exact
-            if "time_h" in rows.columns and "value" in rows.columns:
-                for _, crow in rows.sort_values("time_h").iterrows():
-                    t = _float(crow.get("time_h"))
-                    if t is not None:
-                        trajectory.append(MeasurementPoint(time_h=t, value=_float(crow.get("value"))))
-
-        model_predictions = {}
-        for model_name in ("persistence", "linear", "ridge", "gradient_boosting"):
-            if fr is not None:
-                model_predictions[model_name] = _float(fr.get(f"prediction_{model_name}"))
-
-        forecast = ForecastPayload(
-            horizon_h=_float(fr.get("target_horizon_h")) if fr is not None else 168.0,
-            origin_h=_float(fr.get("forecast_origin_h")) if fr is not None else _float(mb.get("forecast_origin_h")),
-            selected_model=str(fr.get("selected_forecast_model")) if fr is not None and fr.get("selected_forecast_model") is not None else None,
-            prediction=_float(fr.get("prediction_168h")) if fr is not None else None,
-            lower=_float(fr.get("prediction_lower")) if fr is not None else None,
-            upper=_float(fr.get("prediction_upper")) if fr is not None else None,
-            interval_width=_float(fr.get("prediction_interval_width")) if fr is not None else None,
-            conformal_half_width=_float(fr.get("conformal_half_width")) if fr is not None else None,
-            predicted_limit_exceedance=bool(fr.get("predicted_limit_exceedance", 0)) if fr is not None else False,
-            limit_exceedance_probability_proxy=_float(fr.get("limit_exceedance_probability_proxy")) if fr is not None else None,
-            safety_slope_excess=_float(fr.get("safety_slope_excess")) if fr is not None else None,
-            model_predictions=model_predictions,
+        decision_counts = (
+            triage["decision"]
+            .astype(str)
+            .value_counts()
+            .to_dict()
+            if "decision" in triage.columns
+            else {}
         )
 
-        evidence = [
-            EvidenceChannel(name="Population deviation", score=_float(ma.get("population", ma.get("population_evidence")))),
-            EvidenceChannel(name="Temporal drift", score=_float(ma.get("temporal", ma.get("temporal_evidence")))),
-            EvidenceChannel(name="Multivariate novelty", score=_float(ma.get("multivariate", ma.get("multivariate_component_score")))),
-            EvidenceChannel(name="Absolute limit", score=_float(ma.get("absolute_limits")), detail="Authoritative engineering limit check."),
-            EvidenceChannel(name="OOD / domain novelty", score=_float(ood.get("score")), level=str(ood.get("status")) if ood.get("status") is not None else None),
+        return {
+            "run_id": run_dir.name,
+            "rows": int(len(triage)),
+            "components": int(
+                triage["component_id"].nunique()
+            )
+            if "component_id" in triage.columns
+            else 0,
+            "parameters": int(
+                triage["parameter"].nunique()
+            )
+            if "parameter" in triage.columns
+            else 0,
+            "decisions": decision_counts,
+            "risk_mean": self._numeric_mean(
+                triage,
+                "risk_score",
+            ),
+            "ood_status": self._dominant_value(
+                triage,
+                "ood_status",
+            ),
+            "capability_manifest": self._load_json(
+                run_dir,
+                "capability_manifest.json",
+            ),
+            "ingestion_audit": self._load_json(
+                run_dir,
+                "ingestion_audit.json",
+            ),
+        }
+
+    def components(self, run_id: str | None = None) -> list[dict[str, Any]]:
+        _, triage = self._load_triage(run_id)
+        if triage.empty:
+            return []
+
+        group_columns = [
+            column
+            for column in [
+                "component_id",
+                "lot_id",
+                "batch_id",
+                "family",
+            ]
+            if column in triage.columns
         ]
 
-        limits: dict[str, float | None] = {}
-        raw_row = _row_for_part(self.raw, part_id, parameter)
-        for key in ("absolute_limit_lower", "absolute_limit_upper", "engineering_limit_lower", "engineering_limit_upper", "upper_limit", "lower_limit", "spec_upper", "spec_lower"):
-            source = _first_non_null(
-                raw_row.get(key) if raw_row is not None and key in raw_row.index else None,
-                row.get(key) if key in row.index else None,
-                mb.get(key),
-                ma.get(key),
-            )
-            if source is not None:
-                limits[key] = _float(source)
+        if not group_columns:
+            return []
 
-        component = next((x for x in self.components() if x.part_id == str(part_id)), ComponentSummary(part_id=str(part_id), decision=_decision(row.get("decision"))))
-        return ComponentIntelligence(
-            component=component,
-            current_measurements={
-                "value_0h": _float(mb.get("value_0h", row.get("value_0h"))),
-                "value_24h": _float(mb.get("value_24h", row.get("value_24h"))),
-                "value_asof": _float(mb.get("value_asof", row.get("value_asof"))),
-                "parameter": parameter,
-                "physical_quantity": _first_non_null(mb.get("physical_quantity"), row.get("physical_quantity")),
-                "unit": unit,
-            },
-            historical_trajectory=trajectory,
-            forecast=forecast,
-            engineering_limits=limits,
-            anomaly_evidence=evidence,
-            ood=_clean(ood),
-            decision={
-                "decision": _decision(row.get("decision")),
-                "risk_score": _float(row.get("risk_score")),
-                "confidence": row.get("confidence"),
-                "evidence_state": row.get("evidence_state"),
-                "hard_limit_violation": bool(row.get("hard_limit_violation", False)),
-                "near_limit": bool(row.get("near_limit", False)),
-                "supporting_evidence_count": int(_float(row.get("supporting_evidence_count")) or 0),
-                "reasons": _parse_obj(row.get("reasons")),
-                "warnings": _parse_obj(row.get("warnings")),
-                "policy": _clean(policy),
-                "fusion": _clean(fusion),
-                "data_quality": _clean(dq),
-            },
-            explanation=explanation,
-            audit_metadata={
-                "report_source": self.source_label(),
-                "part_id": str(part_id),
-                "trace_present": bool(trace),
-                "source_split": _first_non_null(mb.get("split"), row.get("split")),
-                "failure_mode": _first_non_null(row.get("failure_mode"), mb.get("failure_mode")),
-            },
+        rows: list[dict[str, Any]] = []
+        for key, group in triage.groupby(
+            group_columns,
+            dropna=False,
+            sort=False,
+        ):
+            if not isinstance(key, tuple):
+                key = (key,)
+
+            row = {
+                column: key[index]
+                for index, column in enumerate(group_columns)
+            }
+
+            row.update(
+                {
+                    "parameters": int(
+                        group["parameter"].nunique()
+                    )
+                    if "parameter" in group.columns
+                    else 0,
+                    "risk_score": self._numeric_max(
+                        group,
+                        "risk_score",
+                    ),
+                    "anomaly_risk": self._numeric_max(
+                        group,
+                        "anomaly_risk",
+                    ),
+                    "ood_status": self._dominant_value(
+                        group,
+                        "ood_status",
+                    ),
+                    "decision": self._worst_decision(
+                        group,
+                    ),
+                    "prediction_168h": self._numeric_max(
+                        group,
+                        "prediction_168h",
+                    ),
+                }
+            )
+            rows.append(row)
+
+        return self._json_safe(rows)
+
+    def intelligence(
+        self,
+        component_id: str,
+        *,
+        run_id: str | None = None,
+        parameter: str | None = None,
+    ) -> dict[str, Any] | None:
+        run_dir, triage = self._load_triage(run_id)
+
+        key = str(component_id)
+        mask = triage["component_id"].astype(str).eq(key)
+
+        if parameter is not None and "parameter" in triage.columns:
+            mask &= triage["parameter"].astype(str).eq(
+                str(parameter)
+            )
+
+        selected = triage.loc[mask].copy()
+        if selected.empty:
+            return None
+
+        canonical = self._load_canonical(run_dir)
+        if not canonical.empty and "component_id" in canonical.columns:
+            history = canonical.loc[
+                canonical["component_id"].astype(str).eq(key)
+            ].copy()
+            if parameter is not None and "parameter" in history.columns:
+                history = history.loc[
+                    history["parameter"].astype(str).eq(
+                        str(parameter)
+                    )
+                ]
+        else:
+            history = pd.DataFrame()
+
+        explanations = self._load_explanations(run_dir)
+        explanation_index = {
+            (
+                str(item.get("component_id", "")),
+                str(item.get("parameter", "")),
+            ): item
+            for item in explanations
+        }
+
+        current_rows = selected.to_dict(orient="records")
+        explanation_rows = []
+        for row in current_rows:
+            explanation = explanation_index.get(
+                (
+                    str(row.get("component_id", "")),
+                    str(row.get("parameter", "")),
+                )
+            )
+            if explanation is not None:
+                explanation_rows.append(explanation)
+
+        return self._json_safe(
+            {
+                "run_id": run_dir.name,
+                "component_id": key,
+                "parameters": current_rows,
+                "trajectory": history.to_dict(orient="records"),
+                "explanations": explanation_rows,
+                "capability_manifest": self._load_json(
+                    run_dir,
+                    "capability_manifest.json",
+                ),
+                "ingestion_audit": self._load_json(
+                    run_dir,
+                    "ingestion_audit.json",
+                ),
+            }
         )
+
+    def explanation(
+        self,
+        component_id: str,
+        *,
+        parameter: str | None = None,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        result = self.intelligence(
+            component_id,
+            parameter=parameter,
+            run_id=run_id,
+        )
+        if result is None:
+            return []
+        return result.get("explanations", [])
+
+    @staticmethod
+    def _numeric_mean(
+        frame: pd.DataFrame,
+        column: str,
+    ) -> float | None:
+        if column not in frame.columns:
+            return None
+        values = pd.to_numeric(
+            frame[column],
+            errors="coerce",
+        ).dropna()
+        return float(values.mean()) if not values.empty else None
+
+    @staticmethod
+    def _numeric_max(
+        frame: pd.DataFrame,
+        column: str,
+    ) -> float | None:
+        if column not in frame.columns:
+            return None
+        values = pd.to_numeric(
+            frame[column],
+            errors="coerce",
+        ).dropna()
+        return float(values.max()) if not values.empty else None
+
+    @staticmethod
+    def _dominant_value(
+        frame: pd.DataFrame,
+        column: str,
+    ) -> str | None:
+        if column not in frame.columns:
+            return None
+        values = (
+            frame[column]
+            .dropna()
+            .astype(str)
+        )
+        if values.empty:
+            return None
+        return str(values.value_counts().index[0])
+
+    @staticmethod
+    def _worst_decision(
+        frame: pd.DataFrame,
+    ) -> str:
+        priority = {
+            "REJECT": 4,
+            "UNKNOWN": 3,
+            "REVIEW": 2,
+            "PASS": 1,
+            "SAFE": 1,
+        }
+        if "decision" not in frame.columns:
+            return "UNKNOWN"
+        values = frame["decision"].astype(str).tolist()
+        return max(
+            values,
+            key=lambda value: priority.get(value, 0),
+        ) if values else "UNKNOWN"
