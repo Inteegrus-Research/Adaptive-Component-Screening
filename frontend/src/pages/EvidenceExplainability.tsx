@@ -19,16 +19,17 @@ import { StatusBadge } from '../components/common/StatusBadge'
 
 export function EvidencePage({
   partId,
-  source = 'active',
+  source = 'demo',
   onBack,
   onOpenComponent,
 }: {
   partId: string
-  source?: 'active' | 'demo'
+  source?: string
   onBack: () => void
   onOpenComponent: () => void
 }) {
-  const q = source === 'demo' ? '?source=demo' : ''
+  const resolvedSource = source === 'demo' ? 'demo' : source === 'active' ? 'final_submission' : source || 'final_submission'
+  const q = `?source=${encodeURIComponent(resolvedSource)}`
   const { data, error, loading } = useApi<ComponentIntelligence>(`/api/components/${encodeURIComponent(partId)}${q}`)
 
   if (loading) {

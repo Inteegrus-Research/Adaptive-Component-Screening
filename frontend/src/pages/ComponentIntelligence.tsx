@@ -30,13 +30,14 @@ export function ComponentPage({
   onOpenEvidence,
 }: {
   partId: string
-  source?: 'active' | 'demo'
+  source?: string
   onBack: () => void
   onWhy: () => void
   onOpenEvidence: () => void
 }) {
   const [certOpen, setCertOpen] = useState(false)
-  const q = source === 'demo' ? '?source=demo' : ''
+  const resolvedSource = source === 'demo' ? 'demo' : source === 'active' ? 'final_submission' : source || 'final_submission'
+  const q = `?source=${encodeURIComponent(resolvedSource)}`
   const { data, error, loading } = useApi<ComponentIntelligence>(`/api/components/${encodeURIComponent(partId)}${q}`)
   const { data: prog } = useApi<{ items: ProgressivePoint[]; available?: boolean }>(
     `/api/components/${encodeURIComponent(partId)}/progressive${q}`

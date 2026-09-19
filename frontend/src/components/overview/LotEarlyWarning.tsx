@@ -7,11 +7,12 @@ export function LotEarlyWarning({
   activeLot,
   onSelectLot,
 }: {
-  source?: 'active' | 'demo'
+  source?: string
   activeLot: string | null
   onSelectLot: (lotId: string | null) => void
 }) {
-  const sourceQ = source === 'demo' ? '?source=demo' : ''
+  const resolvedSource = source === 'demo' ? 'demo' : source === 'active' ? 'final_submission' : source || 'final_submission'
+  const sourceQ = `?source=${encodeURIComponent(resolvedSource)}`
   const { data, loading, error } = useApi<LotsResponse>(`/api/lots${sourceQ}`)
 
   const lots: LotSummary[] = data?.lots || (data as any)?.items || []

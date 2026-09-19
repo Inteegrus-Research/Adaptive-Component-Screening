@@ -52,17 +52,19 @@ export function DashboardPage({
 }: {
   onOpen: (id: string) => void
   onNewRun: () => void
-  source?: 'active' | 'demo'
+  source?: string
   session?: ScreeningResponse | null
 }) {
-  const suffix = source === 'demo' ? '&source=demo' : ''
-  const { data: s, loading: sl, error: se, reload } = useApi<BatchSummary>(`/api/summary?source=${source}`)
+  const resolvedSource = source === 'demo' ? 'demo' : source === 'active' ? 'final_submission' : source || 'final_submission'
+  const sourceQ = `?source=${encodeURIComponent(resolvedSource)}`
+  const suffix = `&source=${encodeURIComponent(resolvedSource)}`
+  const { data: s, loading: sl, error: se, reload } = useApi<BatchSummary>(`/api/summary${sourceQ}`)
   const { data: c, loading: cl, error: ce, reload: cr } = useApi<{ items: ComponentSummary[]; count: number }>(
     `/api/components?limit=500${suffix}`
   )
-  const { data: validation } = useApi<ValidationResponse>(`/api/validation?source=${source}`)
-  const { data: lotsData } = useApi<{ items?: LotSummary[]; lots?: LotSummary[]; count?: number }>(`/api/lots?source=${source}`)
-  const { data: engData } = useApi<EngineeringMetricsResponse>(`/api/metrics/engineering?source=${source}`)
+  const { data: validation } = useApi<ValidationResponse>(`/api/validation${sourceQ}`)
+  const { data: lotsData } = useApi<{ items?: LotSummary[]; lots?: LotSummary[]; count?: number }>(`/api/lots${sourceQ}`)
+  const { data: engData } = useApi<EngineeringMetricsResponse>(`/api/metrics/engineering${sourceQ}`)
 
   const lotsList = lotsData?.items || lotsData?.lots || []
 
@@ -179,6 +181,34 @@ export function DashboardPage({
 
   // Engineering Metrics Provenance Extraction (Strictly Real Backend Values)
   const safetyMetrics = engData?.metrics?.metrics || {}
+  const metricValue = (obj: unknown): number | null => {
+    if (obj == null || obj === '') return null
+    if (typeof obj === 'object' && 'value' in (obj as Record<string, unknown>)) {
+      const value = (obj as Record<string, unknown>).value
+      const n = Number(value)
+      return Number.isFinite(n) ? n : null
+    }
+    const n = Number(obj)
+    return Number.isFinite(n) ? n : null
+  }
+  const metricStatus = (obj: unknown): string => {
+    if (obj && typeof obj === 'object' && 'status' in (obj as Record<string, unknown>)) {
+      const status = (obj as Record<string, unknown>).status
+      return status ? String(status) : 'CALCULATED'
+    }
+    return 'CALCULATED'
+  }
+
+  const dppmValue = metricValue(safetyMetrics['post_screening_dppm'])
+  const fnrValue = metricValue(safetyMetrics['latent_escape_fnr'])
+  const escapeValue = metricValue(safetyMetrics['critical_escape_count'])
+  const reviewBurdenValue = metricValue(safetyMetrics['review_burden_ratio'])
+  const falseScrapValue = metricValue(safetyMetrics['false_scrap_rate'])
+  const chamberHoursValue = metricValue(safetyMetrics['chamber_hours_saved_pct'])
+  const oodFlagValue = metricValue(safetyMetrics['ood_flag_rate'])
+  const driftVelocityValue = metricValue(safetyMetrics['drift_velocity'])
+  const intervalWidthValue = metricValue(safetyMetrics['prediction_interval_width'])
+
   const dppmObj = safetyMetrics['post_screening_dppm']
   const fnrObj = safetyMetrics['latent_escape_fnr']
   const escapeObj = safetyMetrics['critical_escape_count']
@@ -194,6 +224,8 @@ export function DashboardPage({
   const reviewPct = ((summary.review / total) * 100).toFixed(1)
   const rejectPct = ((summary.reject / total) * 100).toFixed(1)
   const unknownPct = ((summary.unknown / total) * 100).toFixed(1)
+
+  const provenanceLabel = source === 'demo' ? 'REFERENCE DATA' : session?.run_id ? 'LIVE RUN' : 'ACTIVE DATA'
 
   return (
     <div className="page">
@@ -266,15 +298,11 @@ export function DashboardPage({
         <div className="metricCard cyan">
           <div className="metricCardLabel">Escape Defect DPPM</div>
           <div className="metricCardValue">
-            {dppmObj?.status === 'CALCULATED' && dppmObj.value != null ? (
-              `${num(dppmObj.value, 1)}`
-            ) : (
-              <span style={{ fontSize: '13px', color: 'var(--review)' }}>REQ. GROUND TRUTH</span>
-            )}
+            {dppmValue != null ? `${num(dppmValue, 1)}` : '—'}
           </div>
           <div className="metricCardStatus">
-            <span className={`statusTag ${dppmObj?.status === 'CALCULATED' ? 'calc' : 'gt'}`}>
-              {dppmObj?.status || 'REQUIRES_GROUND_TRUTH'}
+            <span className={`statusTag ${metricStatus(dppmObj) === 'CALCULATED' ? 'calc' : 'gt'}`}>
+              {metricStatus(dppmObj)}
             </span>
             <span>Target: 0.0</span>
           </div>
@@ -284,15 +312,11 @@ export function DashboardPage({
         <div className="metricCard safe">
           <div className="metricCardLabel">Latent Escape (FNR)</div>
           <div className="metricCardValue safeText">
-            {fnrObj?.status === 'CALCULATED' && fnrObj.value != null ? (
-              `${num(fnrObj.value, 2)}%`
-            ) : (
-              <span style={{ fontSize: '13px', color: 'var(--review)' }}>REQ. GROUND TRUTH</span>
-            )}
+            {fnrValue != null ? `${num(fnrValue, 2)}%` : '—'}
           </div>
           <div className="metricCardStatus">
-            <span className={`statusTag ${fnrObj?.status === 'CALCULATED' ? 'calc' : 'gt'}`}>
-              {fnrObj?.status || 'REQUIRES_GROUND_TRUTH'}
+            <span className={`statusTag ${metricStatus(fnrObj) === 'CALCULATED' ? 'calc' : 'gt'}`}>
+              {metricStatus(fnrObj)}
             </span>
             <span>Zero-Escape Target</span>
           </div>
@@ -302,15 +326,11 @@ export function DashboardPage({
         <div className="metricCard reject">
           <div className="metricCardLabel">Critical Escape Count</div>
           <div className="metricCardValue">
-            {escapeObj?.status === 'CALCULATED' && escapeObj.value != null ? (
-              `${escapeObj.value} parts`
-            ) : (
-              <span style={{ fontSize: '13px', color: 'var(--review)' }}>REQ. GROUND TRUTH</span>
-            )}
+            {escapeValue != null ? `${escapeValue} parts` : '—'}
           </div>
           <div className="metricCardStatus">
-            <span className={`statusTag ${escapeObj?.status === 'CALCULATED' ? 'calc' : 'gt'}`}>
-              {escapeObj?.status || 'REQUIRES_GROUND_TRUTH'}
+            <span className={`statusTag ${metricStatus(escapeObj) === 'CALCULATED' ? 'calc' : 'gt'}`}>
+              {metricStatus(escapeObj)}
             </span>
             <span>Defects Cleared Safe</span>
           </div>
@@ -320,15 +340,11 @@ export function DashboardPage({
         <div className="metricCard indigo">
           <div className="metricCardLabel">Chamber Hours Saved</div>
           <div className="metricCardValue indigoText">
-            {chamberHoursObj?.status === 'CALCULATED' && chamberHoursObj.value != null ? (
-              `${num(chamberHoursObj.value, 1)}%`
-            ) : (
-              '—'
-            )}
+            {chamberHoursValue != null ? `${num(chamberHoursValue, 1)}%` : '—'}
           </div>
           <div className="metricCardStatus">
-            <span className={`statusTag ${chamberHoursObj?.status === 'CALCULATED' ? 'calc' : 'na'}`}>
-              {chamberHoursObj?.status || 'CALCULATED'}
+            <span className={`statusTag ${metricStatus(chamberHoursObj) === 'CALCULATED' ? 'calc' : 'na'}`}>
+              {metricStatus(chamberHoursObj)}
             </span>
             <span>vs 168h Burn-in</span>
           </div>
@@ -338,15 +354,11 @@ export function DashboardPage({
         <div className="metricCard review">
           <div className="metricCardLabel">Review Burden Ratio</div>
           <div className="metricCardValue reviewText">
-            {reviewBurdenObj?.status === 'CALCULATED' && reviewBurdenObj.value != null ? (
-              `${num(reviewBurdenObj.value, 1)}%`
-            ) : (
-              '—'
-            )}
+            {reviewBurdenValue != null ? `${num(reviewBurdenValue, 1)}%` : '—'}
           </div>
           <div className="metricCardStatus">
-            <span className={`statusTag ${reviewBurdenObj?.status === 'CALCULATED' ? 'calc' : 'na'}`}>
-              {reviewBurdenObj?.status || 'CALCULATED'}
+            <span className={`statusTag ${metricStatus(reviewBurdenObj) === 'CALCULATED' ? 'calc' : 'na'}`}>
+              {metricStatus(reviewBurdenObj)}
             </span>
             <span>Routed to Engineer</span>
           </div>
@@ -356,15 +368,11 @@ export function DashboardPage({
         <div className="metricCard">
           <div className="metricCardLabel">False Scrap / Overkill</div>
           <div className="metricCardValue">
-            {falseScrapObj?.status === 'CALCULATED' && falseScrapObj.value != null ? (
-              `${num(falseScrapObj.value, 2)}%`
-            ) : (
-              <span style={{ fontSize: '13px', color: 'var(--dim)' }}>REQ. GROUND TRUTH</span>
-            )}
+            {falseScrapValue != null ? `${num(falseScrapValue, 2)}%` : '—'}
           </div>
           <div className="metricCardStatus">
-            <span className={`statusTag ${falseScrapObj?.status === 'CALCULATED' ? 'calc' : 'gt'}`}>
-              {falseScrapObj?.status || 'REQUIRES_GROUND_TRUTH'}
+            <span className={`statusTag ${metricStatus(falseScrapObj) === 'CALCULATED' ? 'calc' : 'gt'}`}>
+              {metricStatus(falseScrapObj)}
             </span>
             <span>Economic Preservation</span>
           </div>
@@ -514,35 +522,35 @@ export function DashboardPage({
         <div className="signalStrip">
           <span className="smallcaps">Median Drift Velocity</span>
           <strong className="mono">
-            {driftVelocityObj?.value != null ? `${num(driftVelocityObj.value, 5)} u/h` : '—'}
+            {driftVelocityValue != null ? `${num(driftVelocityValue, 5)} u/h` : '—'}
           </strong>
         </div>
 
         <div className="signalStrip">
           <span className="smallcaps">Conformal Band Width</span>
           <strong className="mono">
-            {intervalWidthObj?.value != null ? `±${num(intervalWidthObj.value, 4)} u` : '—'}
+            {intervalWidthValue != null ? `±${num(intervalWidthValue, 4)} u` : '—'}
           </strong>
         </div>
 
         <div className="signalStrip">
           <span className="smallcaps">OOD Novelty Rate</span>
           <strong className="mono" style={{ color: 'var(--review)' }}>
-            {oodFlagObj?.value != null ? `${num(oodFlagObj.value, 1)}%` : '—'}
+            {oodFlagValue != null ? `${num(oodFlagValue, 1)}%` : '—'}
           </strong>
         </div>
 
         <div className="signalStrip">
           <span className="smallcaps">Chamber Hours Efficiency</span>
           <strong className="mono" style={{ color: 'var(--safe)' }}>
-            {chamberHoursObj?.value != null ? `${num(chamberHoursObj.value, 1)}% Saved` : '—'}
+            {chamberHoursValue != null ? `${num(chamberHoursValue, 1)}% Saved` : '—'}
           </strong>
         </div>
 
         <div className="signalStrip">
           <span className="smallcaps">Telemetry Provenance</span>
           <strong className="mono" style={{ color: 'var(--accent)' }}>
-            {source === 'demo' ? 'REFERENCE DATA' : session?.run_id ? 'LIVE RUN' : 'ACTIVE DATA'}
+            {provenanceLabel}
           </strong>
         </div>
       </div>

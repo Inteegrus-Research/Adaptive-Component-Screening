@@ -12,10 +12,11 @@ export function ComplianceCertificateModal({
   onClose,
 }: {
   partId: string
-  source?: 'active' | 'demo'
+  source?: string
   onClose: () => void
 }) {
-  const sourceQ = source === 'demo' ? '?source=demo' : ''
+  const resolvedSource = source === 'demo' ? 'demo' : source === 'active' ? 'final_submission' : source || 'final_submission'
+  const sourceQ = `?source=${encodeURIComponent(resolvedSource)}`
   const { data: cert, loading, error } = useApi<ComplianceCertificate>(
     `/api/components/${encodeURIComponent(partId)}/certificate${sourceQ}`
   )

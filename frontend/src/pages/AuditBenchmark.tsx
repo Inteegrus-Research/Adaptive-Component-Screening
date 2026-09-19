@@ -26,14 +26,15 @@ export function AuditPage({
   source = 'active',
 }: {
   onInspect?: (id: string) => void
-  source?: 'active' | 'demo'
+  source?: string
 }) {
-  const q = source === 'demo' ? '?source=demo' : ''
+  const resolvedSource = source === 'demo' ? 'demo' : source === 'active' ? 'final_submission' : source || 'final_submission'
+  const q = `?source=${encodeURIComponent(resolvedSource)}`
   const { data, error, loading } = useApi<BenchmarkResponse>(`/api/audit/benchmark${q}`)
   const { data: validation } = useApi<any>(`/api/validation${q}`)
   const { data: inventory } = useApi<any>(`/api/artifacts${q}`)
   const { data: componentList } = useApi<{ items: any[]; count: number }>(
-    `/api/components?limit=500${source === 'demo' ? '&source=demo' : ''}`
+    `/api/components?limit=500&source=${encodeURIComponent(resolvedSource)}`
   )
 
   const [rawTableTab, setRawTableTab] = useState<string>('system_metrics_mean_std.csv')

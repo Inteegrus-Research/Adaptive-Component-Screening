@@ -19,8 +19,10 @@ import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.ingest import IngestionError, ingest_dataframe
-from src.pipeline import ACSPipeline, run_screening
+from src.ingest import ingest_dataframe
+# Import pipeline functions lazily to avoid import-time dependency issues
+ACSPipeline = None
+run_screening = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +46,35 @@ REPORT_ROOT = Path(
 )
 DEMO_REPORT_ROOT = PROJECT_ROOT / "reports" / "demo_report"
 DEMO_BENCHMARK_ROOT = PROJECT_ROOT / "reports" / "benchmark_kaggle"
+FINAL_SUBMISSION_ROOT = PROJECT_ROOT / "reports" / "final_submission"
+
+
+def _resolve_report_root(source: str | None) -> Path | None:
+    """Resolve a requested report source string to a filesystem Path.
+
+    Accepted values:
+    - None or "final_submission" -> FINAL_SUBMISSION_ROOT
+    - "demo" -> DEMO_REPORT_ROOT
+    - any folder name under PROJECT_ROOT/reports (e.g. "demo_report", "my_run")
+    - a path that is already under PROJECT_ROOT/reports
+    Returns None if the resolved path does not exist.
+    """
+    if source is None:
+        candidate = FINAL_SUBMISSION_ROOT
+    elif source == "demo":
+        return DEMO_REPORT_ROOT
+    elif source == "final_submission":
+        candidate = FINAL_SUBMISSION_ROOT
+    else:
+        # allow either bare folder name or full relative path under reports/
+        candidate = PROJECT_ROOT / "reports" / source
+
+    try:
+        if candidate.exists():
+            return candidate
+    except Exception:
+        return None
+    return None
 
 
 app = FastAPI(
@@ -256,8 +287,23 @@ def health() -> dict[str, Any]:
 
 
 @app.get("/api/health")
-def api_health() -> dict[str, Any]:
-    return health()
+def api_health(source: str | None = Query(default=None)) -> dict[str, Any]:
+    payload = health()
+    if source == "demo":
+        payload["demo_mode"] = True
+        payload["report_source"] = "demo_report"
+        payload["report_dir"] = str(DEMO_REPORT_ROOT)
+    elif source in {None, "active", "final_submission"}:
+        payload["demo_mode"] = False
+        payload["report_source"] = "final_submission"
+        payload["report_dir"] = str(FINAL_SUBMISSION_ROOT)
+    else:
+        resolved = _resolve_report_root(source)
+        if resolved is not None:
+            payload["demo_mode"] = False
+            payload["report_source"] = resolved.name
+            payload["report_dir"] = str(resolved)
+    return payload
 
 
 @app.post("/api/intake/profile")
@@ -267,11 +313,11 @@ async def intake_profile(
     data = await _read_csv_upload(file)
 
     try:
-        canonical, audit = ingest_dataframe(
+        canonical, audit, _quarantined = ingest_dataframe(
             data,
-            parameters_path=PARAMETERS_PATH,
+            PARAMETERS_PATH,
         )
-    except (IngestionError, ValueError, TypeError) as exc:
+    except (ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=422,
             detail=str(exc),
@@ -302,7 +348,9 @@ async def screen(
     data = await _read_csv_upload(file)
 
     try:
-        run = run_screening(
+        from src.pipeline import run_screening as _run_screening
+
+        run = _run_screening(
             data,
             parameters_path=str(PARAMETERS_PATH),
             policy_path=str(POLICY_PATH),
@@ -731,6 +779,19 @@ def api_demo() -> dict[str, Any]:
     }
 
 
+@app.get("/api/report_folders")
+def api_report_folders() -> dict[str, Any]:
+    folders: list[str] = []
+    for path in sorted(PROJECT_ROOT.joinpath("reports").iterdir()):
+        if path.is_dir():
+            folders.append(path.name)
+    return {
+        "folders": folders,
+        "default": "final_submission",
+        "demo": "demo_report",
+    }
+
+
 @app.get("/api/health")
 def api_health(source: str | None = Query(default=None)) -> dict[str, Any]:
     payload = health()
@@ -738,6 +799,16 @@ def api_health(source: str | None = Query(default=None)) -> dict[str, Any]:
         payload["demo_mode"] = True
         payload["report_source"] = "demo_report"
         payload["report_dir"] = str(DEMO_REPORT_ROOT)
+    elif source in {None, "active", "final_submission"}:
+        payload["demo_mode"] = False
+        payload["report_source"] = "final_submission"
+        payload["report_dir"] = str(FINAL_SUBMISSION_ROOT)
+    else:
+        resolved = _resolve_report_root(source)
+        if resolved is not None:
+            payload["demo_mode"] = False
+            payload["report_source"] = resolved.name
+            payload["report_dir"] = str(resolved)
     return payload
 
 
@@ -745,21 +816,38 @@ def api_health(source: str | None = Query(default=None)) -> dict[str, Any]:
 def api_validation(source: str | None = Query(default=None)) -> dict[str, Any]:
     if source == "demo":
         return _demo_validation_payload()
-    return {"ok": True, "source": source or "active", "demo_mode": False, "checks": []}
+
+    resolved = _resolve_report_root(source)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Requested report source not found.")
+
+    from app.services.final_submission import FinalSubmissionService
+
+    service = FinalSubmissionService(resolved)
+    return service.validation()
 
 
 @app.get("/api/artifacts")
 def api_artifacts(source: str | None = Query(default=None)) -> dict[str, Any]:
     if source == "demo":
         return _demo_artifacts_payload()
-    return {"source": source or "active", "demo_mode": False, "artifacts": []}
+
+    resolved = _resolve_report_root(source)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Requested report source not found.")
+
+    from app.services.final_submission import FinalSubmissionService
+
+    service = FinalSubmissionService(resolved)
+    return service.artifacts()
 
 
 @app.get("/api/lots")
 def api_lots(source: str | None = Query(default=None)) -> dict[str, Any]:
     screening = _demo_screening_df() if source == "demo" else pd.DataFrame()
     if source != "demo" or screening.empty:
-        return {"lots": [], "total_lots": 0, "early_warnings": [], "source": source or "active"}
+        # For non-demo sources we do not synthesize lot grouping here; rely on report-backed endpoints.
+        return {"lots": [], "total_lots": 0, "early_warnings": [], "source": source or "final_submission"}
 
     lots: list[dict[str, Any]] = []
     for lot_id, group in screening.groupby("lot_id", dropna=False):
@@ -821,50 +909,45 @@ def api_lots(source: str | None = Query(default=None)) -> dict[str, Any]:
 
 @app.get("/api/metrics/engineering")
 def api_metrics_engineering(source: str | None = Query(default=None)) -> dict[str, Any]:
-    if source != "demo":
-        return {"metrics": {}, "summary_counts": {}}
+    if source == "demo":
+        benchmark = _demo_benchmark_files()
+        progressive = benchmark.get("progressive_metrics_mean.csv", [])
+        return {"metrics": {"progressive_metrics": progressive}, "summary_counts": {"SAFE": 0, "REVIEW": 0, "REJECT": 0, "UNKNOWN": 0}}
+    # For active (non-demo) source return engineered metrics from a resolved report root
+    resolved = _resolve_report_root(source)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Requested report source not found.")
 
-    benchmark = _demo_benchmark_files()
-    system = benchmark.get("system_metrics_mean_std.csv", [])
-    lead = benchmark.get("lead_time_mean_std.csv", [])
-    escape = benchmark.get("latent_escape_mean_std.csv", [])
-    progressive = benchmark.get("progressive_metrics_mean.csv", [])
+    from app.services.final_submission import FinalSubmissionService
 
-    def metric_value(rows: list[dict[str, Any]], key: str) -> float | None:
-        for row in rows:
-            if str(row.get("metric") or row.get("name") or "").lower() == key.lower():
-                return float(row.get("mean", row.get("value", 0)))
-        return None
-
-    metrics = {
-        "post_screening_dppm": {"mean": 420.0, "unit": "DPPM"},
-        "latent_escape_fnr": {"mean": max(0.0, 1.0 - (metric_value(escape, "escape_recall") or 1.0)), "unit": "fraction"},
-        "critical_escape_count": {"mean": 0, "unit": "count"},
-        "review_burden_ratio": {"mean": metric_value(system, "precision") or 0.214, "unit": "ratio"},
-        "false_scrap_rate": {"mean": metric_value(system, "fpr") or 0.087, "unit": "fraction"},
-        "chamber_hours_saved_pct": {"mean": (metric_value(lead, "median_lead_time_h") or 132) / 168 * 100, "unit": "%"},
-        "ood_flag_rate": {"mean": 0.14, "unit": "fraction"},
-        "drift_velocity": {"mean": 0.09, "unit": "norm"},
-        "prediction_interval_width": {"mean": 1.5, "unit": "hours"},
-        "progressive_metrics": progressive,
-    }
+    service = FinalSubmissionService(resolved)
+    metrics = service.engineering_metrics()
     return {"metrics": metrics, "summary_counts": {"SAFE": 0, "REVIEW": 0, "REJECT": 0, "UNKNOWN": 0}}
 
 
 @app.get("/api/audit/benchmark")
 def api_audit_benchmark(source: str | None = Query(default=None)) -> dict[str, Any]:
-    if source != "demo":
-        return {"available": False, "source": source or "active", "demo_mode": False, "files": {}, "artifact_count": 0, "message": "Demo benchmark files are not available for the active source."}
+    if source == "demo":
+        files = _demo_benchmark_files()
+        return {
+            "available": bool(files),
+            "source": "demo_report",
+            "demo_mode": True,
+            "files": files,
+            "artifact_count": len(files),
+            "message": "Connected to demo benchmark evidence from the packaged demonstration report.",
+        }
 
-    files = _demo_benchmark_files()
-    return {
-        "available": bool(files),
-        "source": "demo_report",
-        "demo_mode": True,
-        "files": files,
-        "artifact_count": len(files),
-        "message": "Connected to demo benchmark evidence from the packaged demonstration report.",
-    }
+    # active source: surface the benchmark artifact set for the requested report
+    resolved = _resolve_report_root(source)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Requested report source not found.")
+
+    from app.services.final_submission import FinalSubmissionService
+
+    service = FinalSubmissionService(resolved)
+    files = service.artifacts()
+    return {"available": bool(files.get("artifacts")), "source": str(resolved.name), "demo_mode": False, "files": files.get("artifacts"), "artifact_count": len(files.get("artifacts", [])), "message": f"Connected to {resolved.name} benchmark artifacts."}
 
 
 @app.get("/api/components")
@@ -872,8 +955,16 @@ def components(run_id: str | None = Query(default=None), source: str | None = Qu
     if source == "demo":
         items = _demo_components_payload()[:limit]
         return {"items": items, "count": len(items)}
+    # Serve canonical artifacts for the requested report
+    resolved = _resolve_report_root(source)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Requested report source not found.")
 
-    return _json_safe(ResultsService(REPORT_ROOT).components(run_id=run_id)[:limit])
+    from app.services.final_submission import FinalSubmissionService
+
+    service = FinalSubmissionService(resolved)
+    items = service.components(limit=limit)
+    return {"items": items, "count": len(items)}
 
 
 @app.get("/api/components/{component_id}")
@@ -888,17 +979,16 @@ def component_intelligence(
             raise HTTPException(status_code=404, detail=f"Component {component_id!r} not found in demo report.")
         return _json_safe(result)
 
-    from app.services.results import ResultsService
+    resolved = _resolve_report_root(source)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Requested report source not found.")
 
-    service = ResultsService(REPORT_ROOT)
-    try:
-        result = service.intelligence(component_id, run_id=run_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    from app.services.final_submission import FinalSubmissionService
 
+    service = FinalSubmissionService(resolved)
+    result = service.intelligence(component_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Component {component_id!r} not found.")
-
     return _json_safe(result)
 
 
@@ -998,7 +1088,11 @@ def summary(run_id: str | None = Query(default=None), source: str | None = Query
     if source == "demo":
         return _json_safe(_demo_batch_summary())
 
-    from app.services.results import ResultsService
+    resolved = _resolve_report_root(source)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Requested report source not found.")
 
-    service = ResultsService(REPORT_ROOT)
-    return _json_safe(service.summary(run_id=run_id))
+    from app.services.final_submission import FinalSubmissionService
+
+    service = FinalSubmissionService(resolved)
+    return _json_safe(service.summary())

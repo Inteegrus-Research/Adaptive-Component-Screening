@@ -30,7 +30,7 @@ import { ComplianceCertificateModal } from '../components/common/ComplianceCerti
 
 
 type View = 'overview' | 'component' | 'evidence' | 'audit' | 'intake'
-type SourceMode = 'active' | 'demo'
+type SourceMode = 'active' | 'demo' | string
 
 const NAV: { id: Exclude<View, 'intake'>; label: string; compact: string; icon: ReactNode }[] = [
   { id: 'overview', label: 'Overview', compact: 'Overview', icon: <Layers3 size={19} /> },
@@ -41,19 +41,31 @@ const NAV: { id: Exclude<View, 'intake'>; label: string; compact: string; icon: 
 
 export function App() {
   const [view, setView] = useState<View>('overview')
-  const [source, setSource] = useState<SourceMode>('demo')
+  const [source, setSource] = useState<SourceMode>('active')
   const [selected, setSelected] = useState<string | null>(null)
   const [session, setSession] = useState<ScreeningResponse | null>(null)
   const [whyOpen, setWhyOpen] = useState(false)
 
-  const sourceQ = source === 'demo' ? '?source=demo' : ''
+  const reportFolders = useApi<{ folders: string[]; default: string; demo: string }>(`/api/report_folders`)
+  const reportOptions = useMemo(() => {
+    const folders = reportFolders.data?.folders ?? []
+    const values = new Set<string>(['active', 'demo'])
+    for (const folder of folders) values.add(folder)
+    return Array.from(values).map((value) => ({
+      value,
+      label: value === 'active' ? 'final_submission' : value === 'demo' ? 'demo_report' : value,
+    }))
+  }, [reportFolders.data])
+
+  const sourceValue = source === 'active' ? 'final_submission' : source
+  const sourceQ = source === 'demo' ? '?source=demo' : `?source=${encodeURIComponent(sourceValue)}`
   const components = useApi<{ items: ComponentSummary[]; count: number }>(
-    `/api/components?limit=500${source === 'demo' ? '&source=demo' : ''}`
+    `/api/components?limit=500${source === 'demo' ? '&source=demo' : source === 'active' ? '&source=final_submission' : `&source=${encodeURIComponent(sourceValue)}`}`
   )
   const health = useApi<SystemStatus>(`/api/health${sourceQ}`)
   const validation = useApi<any>(`/api/validation${sourceQ}`)
   const packet = useApi<ComponentIntelligence>(
-    selected ? `/api/components/${encodeURIComponent(selected)}${source === 'demo' ? '?source=demo' : ''}` : null
+    selected ? `/api/components/${encodeURIComponent(selected)}${source === 'demo' ? '?source=demo' : source === 'active' ? '?source=final_submission' : `?source=${encodeURIComponent(sourceValue)}`}` : null
   )
 
   const preferred = useMemo(
@@ -168,6 +180,31 @@ export function App() {
             </div>
 
             <div className="topstate">
+              <div className="sourcePickerWrap" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <label htmlFor="report-source" className="smallcaps" style={{ fontSize: 10, letterSpacing: 1.2, color: 'var(--muted)' }}>
+                  REPORT
+                </label>
+                <select
+                  id="report-source"
+                  value={source}
+                  onChange={(event) => setSource(event.target.value)}
+                  style={{
+                    background: 'rgba(10, 18, 32, 0.7)',
+                    border: '1px solid var(--line)',
+                    borderRadius: 8,
+                    color: 'var(--ink)',
+                    padding: '8px 10px',
+                    minWidth: 170,
+                  }}
+                >
+                  {reportOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
               <button className="btn topNew" onClick={() => setView('intake')}>
                 <UploadCloud size={13} /> NEW SCREENING
               </button>
@@ -297,7 +334,7 @@ function NavButton({
   )
 }
 
-function WhyDrawer({ data, onClose, source = 'demo' }: { data: ComponentIntelligence; onClose: () => void; source?: 'active' | 'demo' }) {
+function WhyDrawer({ data, onClose, source = 'demo' }: { data: ComponentIntelligence; onClose: () => void; source?: string }) {
   const [certModalOpen, setCertModalOpen] = useState(false)
   const c = data.component
   const e = data.explanation || {}

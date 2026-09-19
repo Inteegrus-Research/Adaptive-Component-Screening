@@ -1,87 +1,37 @@
 #!/usr/bin/env python3
-"""Final backend integrity gate for SIH 26170.
-
-This gate checks software integrity and benchmark prerequisites. It deliberately
-never asserts a target recall/FPR/MAE value; empirical performance must come from
-an untouched test evaluation.
-"""
+"""Fail-fast final repository/benchmark integrity gate."""
 from __future__ import annotations
-
-import ast
-import json
-import subprocess
-import sys
+import argparse,re,sys,json
 from pathlib import Path
+import pandas as pd
+ROOT=Path(__file__).resolve().parents[1]
 
-ROOT = Path(__file__).resolve().parents[1]
-
-REQUIRED = [
-    ROOT / "src/anomaly.py",
-    ROOT / "src/forecast.py",
-    ROOT / "src/safety.py",
-    ROOT / "src/features.py",
-    ROOT / "src/ingest.py",
-    ROOT / "src/pipeline.py",
-    ROOT / "src/explain.py",
-    ROOT / "src/evaluation.py",
-    ROOT / "configs/models.yaml",
-    ROOT / "configs/parameters.yaml",
-    ROOT / "configs/policy.yaml",
-    ROOT / "retrain_models.sh",
-    ROOT / "scripts/demo_latent_escape.py",
-    ROOT / "scripts/generate_attributions.py",
-]
-
-
-def main() -> int:
-    missing = [str(p.relative_to(ROOT)) for p in REQUIRED if not p.exists()]
-    if missing:
-        print("MISSING REQUIRED FILES:")
-        print("\n".join(missing))
-        return 2
-
-    py_files = [p for p in REQUIRED if p.suffix == ".py"]
-    for p in py_files:
-        ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
-
-    bash = subprocess.run(["bash", "-n", str(ROOT / "retrain_models.sh")], capture_output=True, text=True)
-    if bash.returncode:
-        print(bash.stderr, file=sys.stderr)
-        return bash.returncode
-
-    required_tokens = {
-        ROOT / "src/evaluation.py": [
-            "false_positive_rate", "false_review_rate", "automatic_reject_burden",
-            "high_safe_false_disposition_rate", "normal_aging_false_alarm_rate",
-            "LATENT_CHANGE_POINT", "LATENT_ACCELERATING", "LATENT_ABRUPT",
-            "progressive_screen_dataframe", "blind_test", "selection_split",
-        ],
-        ROOT / "src/safety.py": [
-            "ood_profile_v4", "0.10 * physical", "0.20 * context", "0.70 * population",
-            "set(_operational_schema(profile.expected_columns))",
-            "redecide_screening",
-        ],
-        ROOT / "src/forecast.py": [
-            "target_", "target_abs", "baseline_value_0h", "precursor_strength",
-            "_persist", "_linear", "nominal_interval_coverage",
-        ],
-        ROOT / "src/pipeline.py": [
-            "value_24h_is_proxy", "feature_availability_manifest", "progressive_screen_dataframe",
-        ],
-        ROOT / "src/explain.py": ["shap_explain", "specific_counterfactual", "pattern_attribution"],
-    }
-    for p, tokens in required_tokens.items():
-        text = p.read_text(encoding="utf-8")
-        absent = [t for t in tokens if t not in text]
-        if absent:
-            print(f"Missing required implementation markers in {p}: {absent}")
-            return 3
-
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument("--input",default=str(ROOT/"data/processed/module_A_dataset.csv")); ap.add_argument("--benchmark-dir",default=str(ROOT/"reports/final_run")); a=ap.parse_args()
+    d=pd.read_csv(a.input); req={"part_id","lot_id","parameter","time_h","value","future_defective","defect_state","split","raw_parameter"}; missing=req-set(d.columns)
+    if missing: raise SystemExit(f"GATE FAIL: missing columns {sorted(missing)}")
+    if set(d.split.astype(str))!={"train","val","test"}: raise SystemExit("GATE FAIL: missing train/val/test")
+    lot_sets={s:set(d.loc[d.split.astype(str).eq(s),"lot_id"].astype(str)) for s in ["train","val","test"]}
+    for a1,b1 in [("train","val"),("train","test"),("val","test")]:
+        if lot_sets[a1]&lot_sets[b1]: raise SystemExit(f"GATE FAIL: lot leakage {a1}/{b1}")
+    if d.duplicated(["part_id","parameter","time_h"]).any(): raise SystemExit("GATE FAIL: duplicate timestamps")
+    n_parts=int(d.part_id.nunique()); n_lots=int(d.lot_id.nunique())
+    if n_parts < 400 or n_lots < 80:
+        raise SystemExit(f"GATE FAIL: final fixture size expected >=400 parts/80 lots, got {n_parts}/{n_lots}. Run the final generator first.")
+    meta_path=ROOT/"data/processed/fixture_metadata.json"
+    if meta_path.exists():
+        meta=json.loads(meta_path.read_text())
+        if abs(float(meta.get("defect_base_rate",0.0))-0.25)>1e-9: raise SystemExit("GATE FAIL: final fixture defect base rate is not 0.25")
+        if float(meta.get("accelerating_coefficient",0.0))<0.0012 or float(meta.get("accelerating_coefficient",0.0))>0.0020: raise SystemExit("GATE FAIL: accelerating coefficient outside approved final range")
+    b=Path(a.benchmark_dir)
+    forbidden=["metric_values=","hardcoded recall","hardcoded fpr","progressive_metrics = {"]
+    for f in [ROOT/"scripts/run_benchmark.py",ROOT/"src/evaluation.py",ROOT/"scripts/generate_demo_report.py"]:
+        txt=f.read_text(errors="ignore").lower()
+        for token in forbidden:
+            if token in txt:
+                raise SystemExit(f"GATE FAIL: prohibited hardcoded metric token {token!r} in {f}")
+    required_files=[ROOT/"src/failure_risk.py",ROOT/"src/monitoring.py",ROOT/"configs/benchmark.yaml",ROOT/"scripts/calibrate_policy.py",ROOT/"scripts/run_ablation.py",ROOT/"scripts/run_generalization_suite.py"]
+    missing_files=[str(x.relative_to(ROOT)) for x in required_files if not x.exists()]
+    if missing_files: raise SystemExit(f"GATE FAIL: missing final architecture files {missing_files}")
     print("FINAL BACKEND GATE: PASS")
-    print("No empirical performance target was assumed or asserted.")
-    print("Run the blind benchmark to obtain the actual submission metrics.")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__=="__main__":main()

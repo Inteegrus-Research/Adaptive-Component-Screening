@@ -1,716 +1,160 @@
+"""Module B: one model per (family, parameter), 168 h target, finite-sample conformal intervals."""
 from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import Any, Mapping
-
-import numpy as np
-import pandas as pd
+from pathlib import Path
+from typing import Any
+import math, joblib, hashlib
+import numpy as np, pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_absolute_error
 
+TARGET=168.0
 
-@dataclass(frozen=True)
-class ForecastConfig:
-    horizon_h: float = 168.0
-    min_component_points: int = 2
-    min_training_components: int = 4
-    min_training_rows: int = 24
-    conformal_alpha: float = 0.05
-    min_calibration_residuals: int = 8
-    cold_start_min_points_for_trend: int = 3
-    uncertainty_growth_per_sqrt_hour: float = 0.02
-    random_state: int = 42
+@dataclass
+class ForecastModel:
+    family: str
+    parameter: str
+    selected_model: str
+    model: Any
+    imputer: Any
+    feature_columns: list[str]
+    residuals: np.ndarray
+    conformal_radius: float
+    validation_metrics: dict[str,float]
 
+class ForecastEngine:
+    def __init__(self, target_horizon:float=168.0, seed:int=20260831):
+        self.target_horizon=target_horizon; self.seed=seed; self.models={}; self.family_radii={}
 
-def _robust_slope(
-    time: np.ndarray,
-    value: np.ndarray,
-) -> float:
-    if len(time) < 2:
-        return 0.0
+    @staticmethod
+    def _part_series(g:pd.DataFrame, origin:float) -> dict[str,float]:
+        z=g[g.time_h<=origin+1e-9].sort_values("time_h")
+        if z.empty: return {"current":np.nan,"value_0h":np.nan,"value_24h":np.nan,"slope_0_24":np.nan,"slope":np.nan,"recent_slope":np.nan,"n_points":0}
+        y=z.value.to_numpy(float); t=z.time_h.to_numpy(float)
+        def sl(tt,yy):
+            ok=np.isfinite(tt)&np.isfinite(yy)
+            if ok.sum()<2: return np.nan
+            return float((yy[ok][-1]-yy[ok][0])/max(tt[ok][-1]-tt[ok][0],1e-9))
+        v0=float(y[np.isfinite(y)][0]) if np.isfinite(y).any() else np.nan
+        v24=float(z.loc[z.time_h.eq(24),"value"].dropna().iloc[-1]) if z.loc[z.time_h.eq(24),"value"].notna().any() else np.nan
+        return {"current":float(y[np.isfinite(y)][-1]) if np.isfinite(y).any() else np.nan,
+                "value_0h":v0,"value_24h":v24,"slope_0_24":sl(t[t<=24],y[t<=24]),"slope":sl(t,y),
+                "recent_slope":sl(t[-3:],y[-3:]),"n_points":int(np.isfinite(y).sum())}
 
-    slopes: list[float] = []
+    def _training_table(self, long_df:pd.DataFrame, family:str, parameter:str, max_origin:float) -> pd.DataFrame:
+        g=long_df[long_df.component_family.astype(str).eq(family)&long_df.parameter.astype(str).eq(parameter)].copy()
+        rows=[]
+        origins=[0.0,12.0,24.0,48.0,72.0,96.0,120.0,144.0]
+        origins=[o for o in origins if o<=max_origin and o<self.target_horizon]
+        for pid,gp in g.groupby("part_id"):
+            target=gp.loc[np.isclose(gp.time_h,self.target_horizon),"value"]
+            if target.empty or not np.isfinite(target.iloc[-1]): continue
+            lot=str(gp.lot_id.iloc[0]); t0=self._part_series(gp,0.0)
+            lotgrp=g[g.lot_id.astype(str).eq(lot)]
+            lot0=lotgrp[np.isclose(lotgrp.time_h,0.0)].value.dropna().to_numpy(float)
+            lot_med=float(np.median(lot0)) if lot0.size else np.nan; lot_mad=float(np.median(np.abs(lot0-lot_med))) if lot0.size else np.nan
+            for o in origins:
+                s=self._part_series(gp,o)
+                if not np.isfinite(s["current"]): continue
+                rows.append({"part_id":str(pid),"family":family,"parameter":parameter,"origin_h":o,
+                             **s,"lot_median_0h":lot_med,"lot_mad_0h":lot_mad,
+                             "current_time":float(o),"target_time":float(self.target_horizon),
+                             "family_code":int(hashlib.sha256(str(family).encode()).hexdigest()[:6],16)%997,"parameter_code":int(hashlib.sha256(str(parameter).encode()).hexdigest()[:6],16)%997,
+                             "target":float(target.iloc[-1])})
+        return pd.DataFrame(rows)
 
-    for i in range(len(time) - 1):
-        dt = time[i + 1:] - time[i]
-        dy = value[i + 1:] - value[i]
+    @staticmethod
+    def _features(t:pd.DataFrame)->list[str]:
+        return ["value_0h","value_24h","slope_0_24","lot_median_0h","lot_mad_0h","current","slope","recent_slope","current_time","target_time","n_points","family_code","parameter_code"]
 
-        valid = (
-            np.isfinite(dt)
-            & np.isfinite(dy)
-            & (dt != 0)
-        )
+    def fit(self, train_df:pd.DataFrame, val_df:pd.DataFrame, as_of_h:float):
+        fampar=sorted(set(map(tuple,train_df[["component_family","parameter"]].drop_duplicates().to_numpy())))
+        for family,parameter in fampar:
+            tt=self._training_table(train_df,family,parameter,as_of_h)
+            if len(tt)<24: continue
+            vc=self._training_table(val_df,family,parameter,as_of_h)
+            if vc.empty: vc=tt.tail(min(32,len(tt))).copy()
+            feats=self._features(tt)
+            X=tt[feats].to_numpy(float); y=tt.target.to_numpy(float)
+            Xi=SimpleImputer(strategy="median"); X=Xi.fit_transform(X)
+            candidates={}
+            # Persistence baseline handled separately; three ML candidates.
+            ridge=Ridge(alpha=1.0).fit(X,y); candidates["ridge"]=ridge
+            hgb=HistGradientBoostingRegressor(max_iter=160,learning_rate=0.045,max_leaf_nodes=15,l2_regularization=0.25,random_state=self.seed).fit(X,y)
+            candidates["gradient_boosting"]=hgb
+            # Validation table may be sparse; score all available.
+            vX=Xi.transform(vc[feats].to_numpy(float)); vy=vc.target.to_numpy(float)
+            metrics={}
+            for name,m in candidates.items():
+                pr=m.predict(vX); ok=np.isfinite(vy)&np.isfinite(pr); metrics[name]=float(mean_absolute_error(vy[ok],pr[ok])) if ok.any() else float("inf")
+            if len(vy):
+                curv=vc.current.to_numpy(float); pers_ok=np.isfinite(vy)&np.isfinite(curv); pers=float(mean_absolute_error(vy[pers_ok],curv[pers_ok])) if pers_ok.any() else float("inf")
+                sl=vc.slope.to_numpy(float); linpred=curv+sl*(self.target_horizon-vc.origin_h.to_numpy(float)); lin_ok=np.isfinite(vy)&np.isfinite(linpred); lin=float(mean_absolute_error(vy[lin_ok],linpred[lin_ok])) if lin_ok.any() else float("inf")
+                metrics["persistence"]=pers; metrics["linear"]=lin
+            selected=min(metrics,key=metrics.get)
+            predv=(vc.current.to_numpy(float) if selected=="persistence" else vc.current.to_numpy(float)+vc.slope.to_numpy(float)*(self.target_horizon-vc.origin_h.to_numpy(float)) if selected=="linear" else candidates[selected].predict(vX))
+            ok=np.isfinite(vy)&np.isfinite(predv); residuals=np.abs(vy[ok]-predv[ok]) if ok.any() else np.array([])
+            if residuals.size:
+                alpha=0.05; k=int(np.ceil((len(residuals)+1)*(1-alpha))); k=min(max(k,1),len(residuals)); q=float(np.sort(residuals)[k-1])
+            else: q=float(np.nanstd(y)) if len(y) else 1.0
+            model = candidates.get(selected)
+            if selected in {"persistence","linear"}: model=selected
+            self.models[(str(family),str(parameter))]=ForecastModel(str(family),str(parameter),selected,model,Xi,feats,residuals,q,metrics)
+        return self
 
-        if np.any(valid):
-            slopes.extend(
-                (dy[valid] / dt[valid]).tolist()
-            )
+    def predict(self, long_df:pd.DataFrame, origin_h:float)->pd.DataFrame:
+        rows=[]
+        for (family,parameter),m in self.models.items():
+            g=long_df[long_df.component_family.astype(str).eq(family)&long_df.parameter.astype(str).eq(parameter)]
+            for pid,gp in g.groupby("part_id"):
+                s=self._part_series(gp,origin_h)
+                if not np.isfinite(s["current"]): continue
+                lot=str(gp.lot_id.iloc[0]); lotgrp=g[g.lot_id.astype(str).eq(lot)]; lot0=lotgrp[np.isclose(lotgrp.time_h,0.0)].value.dropna().to_numpy(float)
+                lot_med=float(np.median(lot0)) if lot0.size else np.nan; lot_mad=float(np.median(np.abs(lot0-lot_med))) if lot0.size else np.nan
+                x=pd.DataFrame([{**s,"lot_median_0h":lot_med,"lot_mad_0h":lot_mad,"current_time":origin_h,"target_time":self.target_horizon,"family_code":int(hashlib.sha256(str(family).encode()).hexdigest()[:6],16)%997,"parameter_code":int(hashlib.sha256(str(parameter).encode()).hexdigest()[:6],16)%997}])[m.feature_columns]
+                if m.selected_model=="persistence": pred=float(s["current"])
+                elif m.selected_model=="linear": pred=float(s["current"] + (s["slope"] if np.isfinite(s["slope"]) else 0.0)*(self.target_horizon-origin_h))
+                else:
+                    pred=float(m.model.predict(m.imputer.transform(x.to_numpy(float)))[0])
+                q=float(m.conformal_radius); lo,hi=pred-q,pred+q
+                rows.append({"part_id":str(pid),"lot_id":lot,"component_family":family,"parameter":parameter,"origin_h":float(origin_h),"target_h":float(self.target_horizon),
+                             "prediction_168h":pred,"prediction_lower":lo,"prediction_upper":hi,"conformal_radius":q,"selected_forecast_model":m.selected_model,
+                             "forecast_mode":"ML" if m.selected_model in {"ridge","gradient_boosting"} else "COLD_START_LINEAR" if m.selected_model=="linear" else "PERSISTENCE",
+                             "uncertainty_score":float(np.clip(q/max(abs(pred),1e-9),0,1))})
+        out=pd.DataFrame(rows)
+        if out.empty:return out
+        # Component-level aggregation: worst normalized uncertainty and predicted boundary risk.
+        return out
 
-    return (
-        float(np.median(slopes))
-        if slopes
-        else 0.0
-    )
+    def save(self,path:Path): path.parent.mkdir(parents=True,exist_ok=True); joblib.dump(self,path)
+    @classmethod
+    def load(cls,path:Path): return joblib.load(path)
 
-
-def _feature_vector(
-    time: np.ndarray,
-    value: np.ndarray,
-    target_time: float,
-) -> np.ndarray:
-    current_time = float(time[-1])
-    current_value = float(value[-1])
-
-    slope = _robust_slope(
-        time,
-        value,
-    )
-
-    recent_start = max(
-        0,
-        len(time) - 4,
-    )
-
-    recent_slope = _robust_slope(
-        time[recent_start:],
-        value[recent_start:],
-    )
-
-    delta = (
-        float(value[-1] - value[-2])
-        if len(value) >= 2
-        else 0.0
-    )
-
-    return np.asarray(
-        [
-            current_value,
-            slope,
-            recent_slope,
-            delta,
-            current_time,
-            target_time,
-            float(len(value)),
-        ],
-        dtype=float,
-    )
-
-
-def _build_training_table(
-    data: pd.DataFrame,
-    family: str,
-    parameter: str,
-    target_component: str,
-) -> pd.DataFrame:
-    subset = data.loc[
-        data["family"].astype(str).eq(str(family))
-        & data["parameter"].astype(str).eq(str(parameter))
-        & ~data["component_id"].astype(str).eq(
-            str(target_component)
-        )
-    ].copy()
-
-    rows: list[dict[str, Any]] = []
-
-    for component_id, group in subset.groupby(
-        "component_id",
-        sort=False,
-    ):
-        group = group.sort_values("time_h")
-
-        time = pd.to_numeric(
-            group["time_h"],
-            errors="coerce",
-        ).to_numpy(dtype=float)
-
-        value = pd.to_numeric(
-            group["value"],
-            errors="coerce",
-        ).to_numpy(dtype=float)
-
-        valid = (
-            np.isfinite(time)
-            & np.isfinite(value)
-        )
-
-        time = time[valid]
-        value = value[valid]
-
-        if len(value) < 2:
-            continue
-
-        for index in range(1, len(value)):
-            x = _feature_vector(
-                time[:index],
-                value[:index],
-                float(time[index]),
-            )
-
-            rows.append(
-                {
-                    "component_id": str(component_id),
-                    "x0": x[0],
-                    "x1": x[1],
-                    "x2": x[2],
-                    "x3": x[3],
-                    "x4": x[4],
-                    "x5": x[5],
-                    "x6": x[6],
-                    "target": float(value[index]),
-                }
-            )
-
+def aggregate_forecast_to_parts(forecasts:pd.DataFrame, long_df:pd.DataFrame)->pd.DataFrame:
+    if forecasts.empty:
+        return pd.DataFrame(columns=["part_id","forecast_risk","forecast_uncertainty","predicted_crossing","crossing_time_h"])
+    rows=[]
+    for pid,g in forecasts.groupby("part_id"):
+        risk=0.0; cross=False; ct=np.nan; unc=float(np.nanmax(g.uncertainty_score))
+        current=long_df[long_df.part_id.astype(str).eq(str(pid))]
+        for _,r in g.iterrows():
+            target=current[current.parameter.astype(str).eq(str(r.parameter))]
+            if target.empty: continue
+            lo=float(target.absolute_limit_lower.dropna().iloc[-1]) if target.absolute_limit_lower.notna().any() else -np.inf
+            hi=float(target.absolute_limit_upper.dropna().iloc[-1]) if target.absolute_limit_upper.notna().any() else np.inf
+            pred=float(r.prediction_168h)
+            cur=target[target.time_h.le(float(r.origin_h)+1e-9)].sort_values("time_h").value.dropna()
+            cv=float(cur.iloc[-1]) if not cur.empty else pred
+            span=max(abs(pred-cv),1e-9)
+            violates = pred<lo or pred>hi
+            risk=max(risk,float(violates))
+            if violates:
+                cross=True
+                limit=lo if pred<lo else hi
+                frac=np.clip(abs(limit-cv)/span,0,1)
+                t=float(r.origin_h)+(168.0-float(r.origin_h))*float(frac)
+                if not np.isfinite(ct) or t<ct: ct=t
+        rows.append({"part_id":str(pid),"forecast_risk":float(risk),"forecast_uncertainty":float(unc),"predicted_crossing":bool(cross),"crossing_time_h":ct})
     return pd.DataFrame(rows)
-
-
-def _fit_ml(
-    data: pd.DataFrame,
-    history: pd.DataFrame,
-    family: str,
-    parameter: str,
-    component_id: str,
-    horizon: float,
-    config: ForecastConfig,
-) -> dict[str, Any] | None:
-    training = _build_training_table(
-        data,
-        family,
-        parameter,
-        component_id,
-    )
-
-    if training.empty:
-        return None
-
-    if training["component_id"].nunique() < (
-        config.min_training_components
-    ):
-        return None
-
-    if len(training) < config.min_training_rows:
-        return None
-
-    feature_columns = [
-        f"x{i}"
-        for i in range(7)
-    ]
-
-    # Component-wise temporal holdout for conformal calibration.
-    calibration_mask = (
-        training.groupby(
-            "component_id",
-            sort=False,
-        ).cumcount(ascending=False) == 0
-    )
-
-    calibration = training.loc[
-        calibration_mask
-    ]
-
-    model_training = training.loc[
-        ~calibration_mask
-    ]
-
-    if len(model_training) < config.min_training_rows:
-        model_training = training.copy()
-        calibration = training.copy()
-
-    model = HistGradientBoostingRegressor(
-        max_iter=250,
-        learning_rate=0.05,
-        max_leaf_nodes=15,
-        l2_regularization=1e-3,
-        random_state=config.random_state,
-    )
-
-    model.fit(
-        model_training[feature_columns],
-        model_training["target"],
-    )
-
-    calibration_prediction = model.predict(
-        calibration[feature_columns]
-    )
-
-    residual = np.abs(
-        calibration["target"].to_numpy()
-        - calibration_prediction
-    )
-
-    if len(residual) >= config.min_calibration_residuals:
-        quantile = 1.0 - config.conformal_alpha
-
-        radius = float(
-            np.quantile(
-                residual,
-                quantile,
-                method="higher",
-            )
-        )
-    else:
-        radius = float(
-            np.quantile(
-                residual,
-                0.95,
-            )
-            if len(residual)
-            else 0.0
-        )
-
-    time = pd.to_numeric(
-        history["time_h"],
-        errors="coerce",
-    ).to_numpy(dtype=float)
-
-    value = pd.to_numeric(
-        history["value"],
-        errors="coerce",
-    ).to_numpy(dtype=float)
-
-    valid = (
-        np.isfinite(time)
-        & np.isfinite(value)
-    )
-
-    time = time[valid]
-    value = value[valid]
-
-    x = _feature_vector(
-        time,
-        value,
-        horizon,
-    )
-
-    prediction = float(
-        model.predict(
-            x.reshape(1, -1)
-        )[0]
-    )
-
-    lower = prediction - radius
-    upper = prediction + radius
-
-    confidence = 1.0 / (
-        1.0
-        + radius
-        / max(abs(prediction), 1e-9)
-    )
-
-    return {
-        "forecast_mode": "ML_FORECAST",
-        "predicted_value_at_horizon": prediction,
-        "prediction_lower": float(lower),
-        "prediction_upper": float(upper),
-        "conformal_radius": float(radius),
-        "forecast_confidence": float(
-            np.clip(confidence, 0.0, 1.0)
-        ),
-        "training_components": int(
-            training["component_id"].nunique()
-        ),
-        "training_rows": int(
-            len(model_training)
-        ),
-    }
-
-
-def _cold_start(
-    history: pd.DataFrame,
-    horizon: float,
-    config: ForecastConfig,
-) -> dict[str, Any]:
-    time = pd.to_numeric(
-        history["time_h"],
-        errors="coerce",
-    ).to_numpy(dtype=float)
-
-    value = pd.to_numeric(
-        history["value"],
-        errors="coerce",
-    ).to_numpy(dtype=float)
-
-    valid = (
-        np.isfinite(time)
-        & np.isfinite(value)
-    )
-
-    time = time[valid]
-    value = value[valid]
-
-    if len(value) < config.min_component_points:
-        return {
-            "forecast_mode": "INSUFFICIENT",
-            "predicted_value_at_horizon": np.nan,
-            "prediction_lower": np.nan,
-            "prediction_upper": np.nan,
-            "conformal_radius": np.nan,
-            "forecast_confidence": 0.0,
-            "training_components": 0,
-            "training_rows": 0,
-        }
-
-    current_time = float(time[-1])
-    current_value = float(value[-1])
-
-    if len(value) >= config.cold_start_min_points_for_trend:
-        slope = _robust_slope(
-            time,
-            value,
-        )
-
-        predicted = (
-            current_value
-            + slope * (horizon - current_time)
-        )
-
-        fitted = (
-            current_value
-            + slope * (time - current_time)
-        )
-
-        residual = value - fitted
-
-        mad = (
-            float(
-                np.median(
-                    np.abs(
-                        residual
-                        - np.median(residual)
-                    )
-                )
-            )
-            if len(residual)
-            else 0.0
-        )
-    else:
-        slope = 0.0
-        predicted = current_value
-
-        delta = (
-            np.diff(value)
-            if len(value) > 1
-            else np.asarray([0.0])
-        )
-
-        mad = float(
-            np.median(
-                np.abs(
-                    delta
-                    - np.median(delta)
-                )
-            )
-        )
-
-    elapsed = max(
-        horizon - current_time,
-        0.0,
-    )
-
-    uncertainty = max(
-        mad,
-        1e-9,
-    ) * (
-        1.0
-        + config.uncertainty_growth_per_sqrt_hour
-        * np.sqrt(elapsed)
-    )
-
-    lower = predicted - uncertainty
-    upper = predicted + uncertainty
-
-    confidence = 1.0 / (
-        1.0
-        + uncertainty
-        / max(abs(predicted), 1e-9)
-    )
-
-    return {
-        "forecast_mode": "COLD_START",
-        "predicted_value_at_horizon": float(predicted),
-        "prediction_lower": float(lower),
-        "prediction_upper": float(upper),
-        "conformal_radius": float(uncertainty),
-        "forecast_confidence": float(
-            np.clip(confidence, 0.0, 1.0)
-        ),
-        "training_components": 0,
-        "training_rows": 0,
-    }
-
-
-def _crossing(
-    history: pd.DataFrame,
-    forecast: Mapping[str, Any],
-    target_horizon: float,
-) -> tuple[bool, float | None, float]:
-    time = pd.to_numeric(
-        history["time_h"],
-        errors="coerce",
-    ).to_numpy(dtype=float)
-
-    value = pd.to_numeric(
-        history["value"],
-        errors="coerce",
-    ).to_numpy(dtype=float)
-
-    valid = (
-        np.isfinite(time)
-        & np.isfinite(value)
-    )
-
-    time = time[valid]
-    value = value[valid]
-
-    if len(value) == 0:
-        return False, None, 0.0
-
-    current_time = float(time[-1])
-    current_value = float(value[-1])
-
-    lower_limit = forecast.get(
-        "lower_limit"
-    )
-
-    upper_limit = forecast.get(
-        "upper_limit"
-    )
-
-    predicted = float(
-        forecast["predicted_value_at_horizon"]
-    )
-
-    lower = float(
-        forecast["prediction_lower"]
-    )
-
-    upper = float(
-        forecast["prediction_upper"]
-    )
-
-    confidence = float(
-        forecast["forecast_confidence"]
-    )
-
-    if upper_limit is not None:
-        boundary = float(upper_limit)
-
-        if current_value > boundary:
-            return True, current_time, 1.0
-
-        if upper >= boundary:
-            denominator = predicted - current_value
-
-            if denominator > 0:
-                fraction = (
-                    boundary - current_value
-                ) / denominator
-
-                estimated = (
-                    current_time
-                    + fraction
-                    * (
-                        target_horizon
-                        - current_time
-                    )
-                )
-
-                return (
-                    True,
-                    float(estimated),
-                    max(confidence, 0.80),
-                )
-
-            return (
-                True,
-                None,
-                max(confidence, 0.80),
-            )
-
-    if lower_limit is not None:
-        boundary = float(lower_limit)
-
-        if current_value < boundary:
-            return True, current_time, 1.0
-
-        if lower <= boundary:
-            denominator = predicted - current_value
-
-            if denominator < 0:
-                fraction = (
-                    boundary - current_value
-                ) / denominator
-
-                estimated = (
-                    current_time
-                    + fraction
-                    * (
-                        target_horizon
-                        - current_time
-                    )
-                )
-
-                return (
-                    True,
-                    float(estimated),
-                    max(confidence, 0.80),
-                )
-
-            return (
-                True,
-                None,
-                max(confidence, 0.80),
-            )
-
-    return False, None, confidence
-
-
-def forecast_components(
-    features: pd.DataFrame,
-    canonical: pd.DataFrame,
-    parameter_config: Mapping[str, Any],
-    config: ForecastConfig | None = None,
-    target_horizon_h: float | None = None,
-) -> pd.DataFrame:
-    if config is None:
-        config = ForecastConfig()
-
-    horizon = float(
-        target_horizon_h
-        if target_horizon_h is not None
-        else config.horizon_h
-    )
-
-    if features.empty:
-        return pd.DataFrame()
-
-    records: list[dict[str, Any]] = []
-
-    for (component_id, parameter), latest_group in features.groupby(
-        ["component_id", "parameter"],
-        sort=False,
-    ):
-        history = canonical.loc[
-            canonical["component_id"].astype(str).eq(
-                str(component_id)
-            )
-            & canonical["parameter"].astype(str).eq(
-                str(parameter)
-            )
-        ].sort_values("time_h")
-
-        if history.empty:
-            continue
-
-        family_values = (
-            history["family"]
-            .dropna()
-            .astype(str)
-        )
-
-        family = (
-            family_values.iloc[-1]
-            if not family_values.empty
-            else "UNKNOWN"
-        )
-
-        model_forecast = _fit_ml(
-            canonical,
-            history,
-            family,
-            str(parameter),
-            str(component_id),
-            horizon,
-            config,
-        )
-
-        if model_forecast is None:
-            model_forecast = _cold_start(
-                history,
-                horizon,
-                config,
-            )
-
-        parameter_spec = (
-            parameter_config
-            .get("parameters", {})
-            .get(str(parameter), {})
-        )
-
-        engineering = parameter_spec.get(
-            "engineering_limit",
-            {},
-        )
-
-        lower_limit = engineering.get(
-            "lower"
-        )
-
-        upper_limit = engineering.get(
-            "upper"
-        )
-
-        crossing_forecast = dict(
-            model_forecast
-        )
-
-        crossing_forecast["lower_limit"] = (
-            lower_limit
-        )
-
-        crossing_forecast["upper_limit"] = (
-            upper_limit
-        )
-
-        crossing, crossing_time, crossing_confidence = _crossing(
-            history,
-            crossing_forecast,
-            horizon,
-        )
-
-        records.append(
-            {
-                "component_id": str(component_id),
-                "parameter": str(parameter),
-                "forecast_mode": model_forecast[
-                    "forecast_mode"
-                ],
-                "predicted_value_at_horizon": model_forecast[
-                    "predicted_value_at_horizon"
-                ],
-                "prediction_lower": model_forecast[
-                    "prediction_lower"
-                ],
-                "prediction_upper": model_forecast[
-                    "prediction_upper"
-                ],
-                "conformal_radius": model_forecast[
-                    "conformal_radius"
-                ],
-                "forecast_confidence": max(
-                    float(
-                        model_forecast[
-                            "forecast_confidence"
-                        ]
-                    ),
-                    crossing_confidence
-                    if crossing
-                    else 0.0,
-                ),
-                "predicted_limit_crossing": bool(
-                    crossing
-                ),
-                "estimated_crossing_time_h": (
-                    crossing_time
-                ),
-                "training_components": model_forecast[
-                    "training_components"
-                ],
-                "training_rows": model_forecast[
-                    "training_rows"
-                ],
-                "target_horizon_h": horizon,
-                "lower_limit": lower_limit,
-                "upper_limit": upper_limit,
-            }
-        )
-
-    return pd.DataFrame(records)
